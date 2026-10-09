@@ -1,0 +1,1264 @@
+"""
+roombapy_prime.auth — Gigya login → iRobot cloud login → Custom Authorizer
+connection tokens.
+
+Extracted and cleaned up from validated, live-tested standalone scripts
+(stage1-4, smart_tier_shadow_check.py). Originally confirmed only
+against Classic-protocol accounts:
+  - one EPHEMERAL-tier robot (900-series, Classic app account)
+  - two SMART-tier robots (i7-series, Classic app account)
+Native binary analysis of the Prime app (liblegacyCore.so) confirmed the
+same field names (connection_tokens, iot_token, iot_signature,
+iot_authorizer_name, client_id, robots) as a hypothesis at the time.
+
+UPDATE (v0.1.2a0, 2026-07-13): this full chain (Discovery -> Gigya ->
+iRobot auth) is now live-confirmed against a real Prime/V4 account
+(chairstacker, Roomba 405/SKU G185020), and again independently against
+a second, different account (jadestar1864, same SKU, different
+household) -- see CHANGELOG.md for both. The hypothesis above is
+resolved: this is not just plausible, it works.
+
+Token lifetime is short (~1 hour) — callers should re-run the full login
+flow rather than trying to refresh in place; there's no known refresh
+endpoint, only re-login.
+
+Also has: CloudCredentials + http_base_auth, carried over from
+ha_roomba_plus's already-production cloud_api.py (a third, independent
+confirmation source alongside live tests and APK analysis) -- see the
+CloudCredentials docstring for details and the limits of this
+carry-over.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sys
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from datetime import datetime
+from json.decoder import JSONDecodeError
+from typing import Any, NoReturn
+
+import aiohttp
+
+from .errors import CloudError, CloudErrorReason, reason_for_status
+
+_LOGGER = logging.getLogger(__name__)
+
+_USER_AGENT_APP = "iRobot/7.16.2.140449 CFNetwork/1568.100.1.2.1 Darwin/24.0.0"
+_APP_ID = "roombapy-prime"
+
+#: Seconds one HTTP request to iRobot's cloud may take, from sending it to
+#: having read the whole answer. Per request, not per call chain: a login
+#: is three requests, and each gets this much.
+#:
+#: NEW IN 0.4.0. Until then the library set no limit and relied on the
+#: caller's session -- and aiohttp sets none by default, so a server that
+#: accepted a request and never answered held the caller forever.
+#: ha_roomba_plus protected itself with its own asyncio.timeout(30) around
+#: a whole refresh; every other caller was unprotected.
+#:
+#: None disables the limit. Every entry point takes `request_timeout`.
+DEFAULT_REQUEST_TIMEOUT: float = 30.0
+
+# NEW (this session, prompted by a real "onboarding is slow" field report):
+# the full login chain (discovery -> Gigya -> iRobot cloud login) is
+# genuinely sequential -- each step needs the previous one's output, so it
+# can't be parallelized. But the discovery step itself
+# (disc-prod.iot.irobotapi.com/v1/discover/endpoints?country_code=...)
+# depends ONLY on country_code -- no username, password, or any other
+# per-user data goes into the request, and the response describes static
+# service infrastructure (deployment endpoints, Gigya app config), not
+# anything user- or session-specific. Caching it is a fundamentally
+# different, much lower-risk kind of caching than caching credentials
+# would be: nothing sensitive is stored, and it helps EVERY login this
+# process makes (not just a one-time config-flow-to-setup handoff) --
+# including ha_roomba_plus's own known duplicate-login pattern during
+# initial onboarding (config flow validates, then async_setup_entry logs
+# in again immediately after), where this cache removes one of the two
+# now-redundant discovery round-trips essentially for free.
+# In-memory only, keyed by country_code, with a conservative TTL --
+# deliberately not indefinite, since this is inherently guessing that
+# iRobot's own infrastructure config doesn't change; a bounded TTL means
+# a real change is picked up within an hour rather than requiring a
+# process restart.
+_DISCOVERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_DISCOVERY_CACHE_TTL_SECONDS = 3600.0
+
+
+async def _get_discovery(
+    session: aiohttp.ClientSession,
+    country_code: str,
+    *,
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> dict[str, Any]:
+    """Fetches (or returns a cached copy of) the discovery response for
+    this country_code. See _DISCOVERY_CACHE's own comment for why this
+    specific response is safe to cache (no per-user data in or out) and
+    why that makes it a fundamentally different, lower-risk decision
+    than caching login credentials would be."""
+    cached = _DISCOVERY_CACHE.get(country_code)
+    if cached is not None:
+        fetched_at, response = cached
+        if time.monotonic() - fetched_at < _DISCOVERY_CACHE_TTL_SECONDS:
+            return response
+
+    try:
+        async with asyncio.timeout(request_timeout):
+            async with session.get(_discovery_url(country_code)) as resp:
+                if resp.status != 200:
+                    raise AuthError(
+                        f"Endpoint discovery failed: HTTP {resp.status}",
+                        reason=reason_for_status(resp.status),
+                    )
+                disc = await resp.json()
+    except aiohttp.ContentTypeError as exc:
+        # An answer, just not JSON -- a response problem, not a broken
+        # connection, so it must not read like one.
+        raise AuthError(f"Endpoint discovery answered with {exc.message!r}, not JSON") from exc
+    except JSONDecodeError as exc:
+        raise AuthError("Endpoint discovery answered with invalid JSON") from exc
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        _raise_transport_error(exc)
+
+    # Checked HERE, before it is cached: a non-object would otherwise
+    # sit in the cache for an hour and fail every login in that hour
+    # with a TypeError deep in login().
+    if not isinstance(disc, dict):
+        raise AuthError(f"Endpoint discovery answered with {type(disc).__name__}, not an object", disc)
+    _DISCOVERY_CACHE[country_code] = (time.monotonic(), disc)
+    return disc
+
+
+class AuthError(CloudError):
+    """Raised for any failure in the discovery/Gigya/login chain, with
+    the offending stage's raw response attached where available.
+
+    Subclassed below (this session, ha_roomba_plus translation-key
+    prep) into more specific categories -- callers that only care
+    about "something failed" can keep catching AuthError itself
+    (every subclass IS-A AuthError), while callers that need to map
+    to different user-facing messages/translation keys (e.g.
+    ha_roomba_plus's config_flow.py: "invalid_cloud_credentials" vs
+    "cannot_connect") can catch the specific subclass instead of
+    string-matching the message text -- fragile, and exactly what
+    this change avoids.
+
+    A PLAIN AuthError is a response-shape problem (see
+    AuthCredentialsError), so that is its reason unless a raise names
+    another."""
+
+    reason: CloudErrorReason = CloudErrorReason.RESPONSE_MALFORMED
+
+    def __init__(
+        self, message: str, raw_response: Any = None, *, reason: CloudErrorReason | None = None
+    ) -> None:
+        super().__init__(message, reason=reason)
+        self.raw_response = raw_response
+
+
+class AuthCredentialsError(AuthError):
+    """The login attempt itself was rejected -- wrong username/password
+    (Gigya) or the login was otherwise refused by iRobot's backend
+    post-Gigya-success. NOT raised for the "mqtt slot" rate-limit case
+    (see AuthRateLimitedError) or for malformed/incomplete responses
+    (those stay a plain AuthError -- they indicate a response-shape
+    problem, not something a user did wrong)."""
+
+    reason: CloudErrorReason = CloudErrorReason.CREDENTIALS_REJECTED
+
+
+class AuthRateLimitedError(AuthError):
+    """iRobot's backend rejected the login due to too many active app
+    sessions/tokens (the real, confirmed "mqtt slot" failure mode --
+    see _login_irobot()). Distinct from AuthCredentialsError: telling
+    someone to re-check their password when the actual fix is "close
+    the iRobot app and try again" would be actively misleading."""
+
+    reason: CloudErrorReason = CloudErrorReason.TOO_MANY_SESSIONS
+
+
+class AuthSSLError(AuthError):
+    """TLS/certificate verification failure -- see
+    _raise_clear_ssl_error(). `reason` says which of three causes."""
+
+    reason: CloudErrorReason = CloudErrorReason.SSL_UNVERIFIED
+
+
+class AuthConnectionError(AuthError):
+    """Could not establish a connection at all (DNS failure, connection
+    refused, network unreachable) -- see _raise_clear_connection_error().
+    Deliberately does NOT claim to know whether this is iRobot's fault
+    or the caller's own network, unlike AuthSSLError's confident
+    "definitely temporary, definitely not you" framing -- that
+    confidence isn't justified here.
+
+    `reason` is CONNECTION_BROKEN when a connection was made and broke
+    off mid-answer, CONNECTION_FAILED when none was made."""
+
+    reason: CloudErrorReason = CloudErrorReason.CONNECTION_FAILED
+
+
+class AuthTimeoutError(AuthError):
+    """Request was sent but no response came back in time -- see
+    _raise_clear_timeout_error()."""
+
+    reason: CloudErrorReason = CloudErrorReason.TIMEOUT
+
+
+def _raise_transport_error(exc: BaseException) -> NoReturn:
+    """Maps ANY failure of a login request to its AuthError.
+
+    NEW IN 0.4.0. Each stage used to catch three aiohttp errors --
+    ClientSSLError, ServerTimeoutError, ClientConnectorError -- and let
+    everything else escape as raw aiohttp or asyncio. Measured against a
+    local server, a connection dropped mid-answer came through as
+    aiohttp.ServerDisconnectedError and a timeout from the caller's
+    session as a bare TimeoutError: neither is an AuthError, so neither
+    is a CloudError, and `except CloudError` missed both.
+
+    Order matters: ClientSSLError is a ClientConnectorError, and
+    aiohttp.ServerTimeoutError is a TimeoutError.
+    """
+    if isinstance(exc, aiohttp.ClientSSLError):
+        _raise_clear_ssl_error(exc)
+    if isinstance(exc, TimeoutError):
+        _raise_clear_timeout_error(exc)
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        _raise_clear_connection_error(exc)
+    if isinstance(exc, aiohttp.ClientResponseError):
+        # The server answered; the answer was the problem.
+        raise AuthError(
+            f"iRobot's cloud answered unexpectedly: {exc.status} {exc.message}",
+            reason=reason_for_status(exc.status),
+        ) from exc
+    raise AuthConnectionError(
+        "The connection to iRobot's cloud broke off during login "
+        f"({type(exc).__name__}). This is usually temporary -- please try "
+        "again in a few minutes.",
+        reason=CloudErrorReason.CONNECTION_BROKEN,
+    ) from exc
+
+
+def _ssl_diagnosis(exc: BaseException) -> tuple[CloudErrorReason, str]:
+    """Which of three certificate problems this is, and what to say
+    about it -- for login, REST and MQTT alike.
+
+    SHARED SINCE 0.4.0. Login diagnosed the cause (below); REST and MQTT
+    raised one fixed message instead, "almost always a temporary problem
+    on iRobot's servers ... not something wrong with your setup" -- the
+    claim login dropped after a field report showed it wrong for a local
+    trust-store problem, where waiting fixes nothing. One diagnosis now,
+    and `reason` carries its answer.
+
+    Full evidence trail, correction history and open questions:
+    docs/internal/EVIDENCE_TRAIL.md#auth_raise_clear_ssl_error
+    """
+    reason = _ssl_verify_reason(exc)
+    # THE PYTHON THAT IS RUNNING, not a fixed one. The path named 3.13
+    # whatever ran it; the first tester to hit this on a Mac had 3.14.
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    # CERTIFI ONLY HELPS WHEN SOMETHING READS IT. The login and REST
+    # requests use Python's default SSL context, which does not look at
+    # certifi -- so "pip install --upgrade certifi" alone changed
+    # nothing. Pointing SSL_CERT_FILE at its bundle does.
+    certifi_fix = (
+        "  pip install --upgrade certifi\n"
+        '  export SSL_CERT_FILE="$(python -m certifi)"'
+    )
+    hint = (
+        "\n\nOpenSSL reported: " + reason if reason else ""
+    )
+
+    if reason and ("local issuer" in reason or "self signed" in reason or "unable to get" in reason):
+        return CloudErrorReason.SSL_LOCAL_TRUST_STORE, (
+            "Could not verify iRobot's cloud server certificate, because this machine "
+            "has no trusted root certificate to check it against. This is a LOCAL setup "
+            "problem, not an iRobot outage -- waiting will not fix it.\n\n"
+            "On macOS with Python from python.org, this is almost always the missing "
+            "one-time certificate install. Run:\n"
+            f"  /Applications/Python\\ {version}/Install\\ Certificates.command\n\n"
+            "Otherwise, point Python at the certifi bundle:\n"
+            f"{certifi_fix}\n\n"
+            "A corporate proxy or VPN that re-signs TLS traffic can produce the same "
+            "error." + hint
+        )
+
+    if reason and "expired" in reason:
+        return CloudErrorReason.SSL_CERTIFICATE_EXPIRED, (
+            "iRobot's cloud server certificate has expired. This is on their end, not "
+            "yours -- nothing to fix locally; it usually resolves within a few hours "
+            "once they renew it." + hint
+        )
+
+    return CloudErrorReason.SSL_UNVERIFIED, (
+        "Could not verify iRobot's cloud server certificate. Two causes are roughly "
+        "equally likely and this error alone cannot tell them apart:\n"
+        "  1. This machine's trusted-root store -- on macOS with Python from "
+        f"python.org, run '/Applications/Python {version}/Install Certificates.command' "
+        "once; otherwise point Python at the certifi bundle "
+        '(pip install certifi, then export SSL_CERT_FILE="$(python -m certifi)").\n'
+        "  2. A genuinely expired certificate on iRobot's servers, which resolves on "
+        "its own.\n"
+        "If it fails repeatedly across hours or versions, cause 1 is far likelier." + hint
+    )
+
+
+def _raise_clear_ssl_error(exc: aiohttp.ClientSSLError) -> NoReturn:
+    """Re-raise an aiohttp SSL/certificate failure as a clear
+    AuthSSLError instead of letting the raw aiohttp exception bubble
+    up as an opaque "unknown error occurred" -- see _ssl_diagnosis()."""
+    reason, message = _ssl_diagnosis(exc)
+    raise AuthSSLError(message, reason=reason) from exc
+
+
+def _ssl_verify_reason(exc: BaseException) -> str | None:
+    """Digs OpenSSL's own verify_message out of the exception chain --
+    the single most informative field for telling a local trust-store
+    problem apart from a genuinely bad server certificate. Returns None
+    rather than guessing if the chain doesn't carry one."""
+    import ssl  # noqa: PLC0415
+
+    # NEVER str() the aiohttp exception itself: ClientSSLError.__str__
+    # dereferences its connection_key, which is None when the exception
+    # was constructed directly (as our own tests do, and as some aiohttp
+    # paths do too) -- stringifying it raises AttributeError from inside
+    # the error handler. Found the hard way. We walk args/causes and
+    # collect only the strings, which is safe regardless.
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    texts: list[str] = []
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            message = getattr(current, "verify_message", None)
+            if isinstance(message, str) and message:
+                return message
+        for arg in getattr(current, "args", ()):
+            if isinstance(arg, str):
+                texts.append(arg)
+            elif isinstance(arg, BaseException):
+                stack.append(arg)
+        stack.append(current.__cause__)
+        stack.append(current.__context__)
+    return "; ".join(texts) or None
+
+
+def _raise_clear_connection_error(exc: aiohttp.ClientConnectorError) -> NoReturn:
+    """Re-raise a connection failure (DNS, connection refused, network
+    unreachable) as a clear AuthConnectionError.
+
+    NEW (this session). Unlike _raise_clear_ssl_error(), deliberately
+    does NOT claim confident fault attribution -- a ClientConnectorError
+    genuinely could be either iRobot's servers being unreachable or the
+    caller's own network/DNS being down, and there's no way to tell
+    which from this exception alone."""
+    raise AuthConnectionError(
+        "Could not connect to iRobot's cloud servers. This could be a "
+        "temporary problem with iRobot's servers, or with your own "
+        "internet connection -- check that other internet-dependent "
+        "services are working, and try again in a few minutes."
+    ) from exc
+
+
+def _raise_clear_timeout_error(exc: BaseException) -> NoReturn:
+    """Re-raise a request timeout as a clear AuthTimeoutError.
+
+    NEW (this session). Accepts BaseException rather than a specific
+    timeout type since both aiohttp.ServerTimeoutError and plain
+    asyncio.TimeoutError are plausible here depending on exactly where
+    the timeout occurs -- the message is the same either way."""
+    raise AuthTimeoutError(
+        "iRobot's cloud servers took too long to respond. This is "
+        "usually temporary -- please try again in a few minutes."
+    ) from exc
+
+
+@dataclass(frozen=True)
+class CloudCredentials:
+    """AWS Cognito credentials for signing REST calls (AWS SigV4) --
+    separate from ConnectionToken, which is for the AWS IoT MQTT
+    Custom Authorizer path. Two independent credential sets from the
+    same login response (under the "credentials" key).
+
+    Field names (AccessKeyId, SecretKey, SessionToken, CognitoId,
+    Expiration) carried over 1:1 from ha_roomba_plus's already-
+    production cloud_api.py -- used there since version 3.x to sign
+    the Classic-protocol REST endpoints (/v1/{blid}/pmaps,
+    /v1/{blid}/missionhistory, etc.). That's a third, independent
+    confirmation source (alongside live tests and APK analysis) --
+    BUT: never tested against a p2maps endpoint or a Prime/V4 account,
+    only against the Classic REST endpoints. Whether Prime needs the
+    same signing at all is a carry-over assumption (see rest_client.py),
+    not a confirmed fact.
+
+    Expiration is an ISO-8601 string ("2026-07-10T17:29:39+00:00"),
+    NOT a Unix-epoch int like ConnectionToken.expires -- a different
+    format convention for the same login response payload, carried
+    over unchanged from the original code.
+
+    UPDATE (session 52): secret_key/session_token are now `repr=False`
+    -- a genuine, pre-existing gap found while adding a similarly
+    credential-bearing new model (RobotLoginEntry). Without this, the
+    default dataclass repr would print the full secret key/session
+    token in plain text on any accidental print()/log/exception
+    traceback involving this object -- exactly the kind of thing this
+    project has otherwise been careful about (e.g. never logging full
+    tokens elsewhere), just missed here until now."""
+
+    access_key_id: str
+    secret_key: str = field(repr=False)
+    session_token: str = field(repr=False)
+    cognito_id: str
+    expiration: datetime | None = None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> CloudCredentials:
+        expiration_raw = data.get("Expiration")
+        expiration = None
+        if expiration_raw:
+            try:
+                expiration = datetime.fromisoformat(expiration_raw)
+            except ValueError:
+                expiration = None
+        return cls(
+            access_key_id=data["AccessKeyId"],
+            secret_key=data["SecretKey"],
+            session_token=data["SessionToken"],
+            cognito_id=data["CognitoId"],
+            expiration=expiration,
+        )
+
+    @property
+    def region(self) -> str:
+        """Extracted from CognitoId (format "region:uuid") -- confirmed
+        pattern from cloud_api.py's _aws_get()."""
+        return self.cognito_id.split(":")[0]
+
+
+@dataclass(frozen=True)
+class ConnectionToken:
+    """One entry from the login response's connection_tokens list —
+    everything needed to open an AWS IoT Custom Authorizer connection.
+
+    Confirmation levels differ by field, deliberately reflected below:
+      - client_id, iot_token, iot_signature, iot_authorizer_name: confirmed
+        both in live-captured responses AND as literal strings in Prime's
+        native library (liblegacyCore.so). Required — a KeyError here
+        means something is fundamentally wrong with the response shape,
+        not a minor field difference.
+      - expires, devices: confirmed present in live-captured Classic/
+        EPHEMERAL responses, but never specifically searched for/found
+        as native strings in Prime's binary the way the other four were.
+        Treated defensively here (.get() with a safe default) rather
+        than required, since a Prime/V4 response's exact shape for these
+        two fields hasn't been verified — don't let a missing/differently
+        -shaped field here be fatal for something otherwise usable.
+
+    UPDATE (session 52): iot_token/iot_signature are now `repr=False`
+    -- same fix, same reason as CloudCredentials' secret_key/
+    session_token (see that class' docstring). These are genuine
+    connection credentials and shouldn't appear in a default repr.
+    """
+
+    client_id: str
+    iot_token: str = field(repr=False)
+    iot_signature: str = field(repr=False)
+    iot_authorizer_name: str
+    expires: int | None
+    devices: list[str]
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ConnectionToken:
+        return cls(
+            client_id=data["client_id"],
+            iot_token=data["iot_token"],
+            iot_signature=data["iot_signature"],
+            iot_authorizer_name=data["iot_authorizer_name"],
+            expires=data.get("expires"),
+            devices=list(data.get("devices") or []),
+        )
+
+    def seconds_until_expiry(self, now: float | None = None) -> float | None:
+        """None if expires is unknown (see the class docstring for why
+        that field is defensive rather than required) -- callers that
+        want to proactively refresh (see mqtt_client.py's
+        seconds_until_token_refresh_due()) must treat None as "can't
+        schedule a refresh", not as "never expires"."""
+        if self.expires is None:
+            return None
+        current = now if now is not None else time.time()
+        return self.expires - current
+
+
+@dataclass(frozen=True)
+class RobotCapabilities:
+    """NEW (session 52). CONFIRMED via
+    Robot$Capabilities$$serializer's <clinit>: binFullDetect, addOnHw,
+    oMode, pose, ota, multiPass. Nested inside RobotLoginEntry.cap."""
+
+    bin_full_detect: Any | None = None
+    add_on_hw: Any | None = None
+    o_mode: Any | None = None
+    pose: Any | None = None
+    ota: Any | None = None
+    multi_pass: Any | None = None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> RobotCapabilities:
+        return cls(
+            bin_full_detect=data.get("binFullDetect"),
+            add_on_hw=data.get("addOnHw"),
+            o_mode=data.get("oMode"),
+            pose=data.get("pose"),
+            ota=data.get("ota"),
+            multi_pass=data.get("multiPass"),
+        )
+
+
+@dataclass(frozen=True)
+class RobotDigitalCapabilities:
+    """NEW (session 52). CONFIRMED via
+    Robot$DigitalCapabilities$$serializer's <clinit>: smartClean.
+    Nested inside RobotLoginEntry.digi_cap."""
+
+    smart_clean: Any | None = None
+    #: THE OTHER TWELVE. `digiCap` carries thirteen flags in app 3.0.0
+    #: and this class read one.
+    #:
+    #: They are what makes a feature model-dependent rather than
+    #: firmware-dependent, and several answer questions this project has
+    #: asked the hard way:
+    #:
+    #:   cwia               "Clean While Away" -- whether presence-based
+    #:                      cleaning exists on THIS robot at all
+    #:   ddAutomation       Dirt Detective, the vendor's own demand
+    #:                      cleaning
+    #:   cte                cleaning time estimates -- whether asking
+    #:                      for them is worth a call
+    #:   thresholds         doorway thresholds in map editing
+    #:   kozRecommendations suggested keep-out zones
+    #:
+    #: Typed as the DTO types them: Boolean except `appVer`,
+    #: `cleaningProfiles` and `smartClean`, which are Integer.
+    app_ver: int | None = None
+    cleaning_profiles: int | None = None
+    cleaning_time_estimates: bool | None = None
+    clean_while_away: bool | None = None
+    dirt_detective_automation: bool | None = None
+    digital_spot: bool | None = None
+    koz_recommendations: bool | None = None
+    matter: bool | None = None
+    perspective_3d_map: bool | None = None
+    pet_furniture: bool | None = None
+    thresholds: bool | None = None
+    timeline: bool | None = None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> RobotDigitalCapabilities:
+        return cls(
+            smart_clean=data.get("smartClean"),
+            app_ver=data.get("appVer"),
+            cleaning_profiles=data.get("cleaningProfiles"),
+            cleaning_time_estimates=data.get("cte"),
+            clean_while_away=data.get("cwia"),
+            dirt_detective_automation=data.get("ddAutomation"),
+            digital_spot=data.get("digiSpot"),
+            koz_recommendations=data.get("kozRecommendations"),
+            matter=data.get("matter"),
+            perspective_3d_map=data.get("perspective3DMap"),
+            pet_furniture=data.get("petFurniture"),
+            thresholds=data.get("thresholds"),
+            timeline=data.get("timeline"),
+        )
+
+
+# Which SKU prefixes identify a V4/Prime-generation robot.
+#
+# MOVED HERE FROM ha_roomba_plus (this session). This is protocol
+# knowledge, not integration knowledge -- the diagnostic tools need it
+# just as much, and two copies would drift. ha_roomba_plus imports it
+# from here now.
+#
+# TWO characters, and both the lower and upper bound matter.
+#
+# One is too few: SkuUtils.java's table uses "R" for BOTH generations --
+# R285020 (Prime) against R980020 and R111840 (Classic). That pair sits
+# on a real tester's account, so a single-letter check would eventually
+# set up a local-capable robot as cloud-only.
+#
+# Three is too many, and this is the part that took field data to see.
+# The APK table lists ONE default SKU per platform, not the variants
+# actually sold. At three characters, four of this project's five
+# Classic field robots fall outside it:
+#
+#     i755840 (i7+) -> i75, table has i71
+#     i355640 (i3+) -> i35, table has i31
+#     S955840 (s9+) -> S95, table has s91
+#     m613840 (m6)  -> m61, matches
+#
+# At two characters all four match, and the Prime and Classic sets stay
+# disjoint -- verified, no collisions in either direction.
+#
+# Original three-character reasoning, kept because it is still why one
+# character is wrong:
+# SkuUtils.java's own platform table shows "R" and "Q" are each used by
+# BOTH generations -- R285020 (Prime) vs. R980020 (Classic, a real test
+# unit in this project) and R111840 (Classic); Q352020 (Prime) vs. "q"
+# as a known Classic prefix. A single-letter check would eventually
+# classify a real Classic robot as Prime, which is the worse failure:
+# it would silently set a local-capable device up as cloud-only rather
+# than failing loudly.
+#
+# Field-confirmed by a real device: G18 (chairstacker, jadestar1864),
+# N18 (DaRealGuGu -- whose account also holds an R98 classic Roomba 980,
+# exactly the pair this check has to tell apart), Y41 (arielgr, sku
+# Y414040). The rest come from SkuUtils.java's table directly and have
+# not been seen in the field.
+# FOUR PREFIXES ADDED FROM APP 3.0.0, which carries a table this list
+# predates.
+#
+# `ProductMode::getModeBySku` maps eighteen two-character SKU prefixes to
+# UI variants -- the same prefix logic as `SkuUtils.java`, but current.
+# Four of its entries were missing here:
+#
+#     U1  robot_205_vac        W2  robot_715_vac
+#     V1  robot_615_combo      Z1  robot_875
+#
+# WHY THAT MATTERED: `is_prime_sku()` returning False routes a robot
+# down the path for devices this library does not know, and for a Prime
+# robot that means being set up as something it is not. The docstring
+# already warns that False is not a Classic confirmation; these four
+# were cases where it silently was one.
+#
+# COLLISION-CHECKED BEFORE ADDING, because the whole two-character
+# design rests on the Prime and Classic sets staying disjoint: none of
+# U1/V1/W2/Z1 appears among the Classic prefixes, and the assertion
+# below still holds.
+#
+# NONE FIELD-CONFIRMED. Like most of the entries above they come from a
+# vendor table, not from a robot. The 3.0.0 table is the newer of the
+# two sources, which is the whole reason to prefer it here.
+PRIME_SKU_PREFIXES: frozenset[str] = frozenset(
+    "G18 G28 N18 N28 Q35 Q01 Y35 Y41 Y01 L12 K15 R28 W15 X18 X28 F15 "
+    "U10 V10 W20 Z10".split()
+)
+
+
+# The Classic side of the same table, for the question is_prime_sku()
+# cannot answer.
+#
+# WHY BOTH ARE NEEDED. is_prime_sku() returning False means "not known
+# to be Prime" -- never "confirmed Classic". Anything treating that as a
+# Classic confirmation misreads it, and a caller filtering with
+# `not is_prime_sku(...)` silently routes an unrecognised Prime robot
+# down the local path.
+#
+# A single-letter check cannot close that gap either: SkuUtils.java's
+# table uses "R" for BOTH generations -- R285020 (Prime, EnhancedCombo-
+# NextPlus) against R980020 and R111840 (Classic). That is precisely
+# the pair a real tester's account contains.
+#
+# Platform names in comments are SkuUtils.java's own. The Classic/Prime
+# split is NOT explicit in the decompiled source: it is read off the
+# naming scheme, where the Essential/Enhanced/Max/Combo families are
+# the Prime generation. Solid, but an inference rather than a fact.
+CLASSIC_SKU_PREFIXES: frozenset[str] = frozenset(
+    (
+        "R98 "   # DEFAULT_SKU fallback (R980020); also the real 980 test unit
+        "R11 "   # Atlantis
+        "i11 "   # Eva
+        "i31 "   # Daredevil
+        "i71 "   # Lewis
+        "j71 "   # Sapphire
+        "j91 "   # Ruby
+        "m61 "   # SanMarino
+        "s91 "   # Soho
+        "x01 "   # Stingray
+        "a21 "   # AirbenderLite
+        "p11 "   # AirbenderPro
+        #
+        # BELOW THIS LINE: product families NOT in SkuUtils.java, added
+        # from the shipped product range. The APK lists one default SKU
+        # per internal platform, and iRobot sold considerably more
+        # variants than that -- i8 was already confirmed missing by a
+        # real device (veronoicc, i857640) before this list was widened.
+        #
+        # Safe to be generous here for two reasons. Classic is a closed
+        # generation: iRobot has moved to the Prime line, so this set
+        # will not grow further. And every entry below was checked
+        # against PRIME_SKU_PREFIXES first -- "q0" was a candidate and
+        # was DROPPED, because Prime's CongoVacuum (Q012020) claims it.
+        # That collision is exactly the kind this list must not create.
+        "i45 "   # i4/i4+ (retail variant)
+        "i55 "   # i5/i5+ Combo
+        "i65 "   # i6+ (Amazon exclusive)
+        "i85 "   # i8/i8+ — confirmed by a real device (veronoicc, i857640)
+        "j55 "   # j5/j5+ Combo
+        "j65 "   # j6/j6+
+        "e51 "   # e5
+        "e61"    # e6 (retail variant)
+    ).split()
+)
+
+# INCOMPLETE BY CONSTRUCTION, and callers must treat it that way.
+# SkuUtils.java lists ONE default SKU per platform, not the variants
+# actually sold. Every Classic robot in this project's own field-test
+# fleet except one falls outside it:
+#
+#     i755840, i755640  (i7+)     -> i75, table has i71
+#     i857640           (i8+)     -> i85, no entry at all
+#     i355640           (i3+)     -> i35, table has i31
+#     R980040           (980)     -> R98, matches
+#
+# So "not in this table" is NOT evidence of Prime. The table is useful
+# for the opposite direction only: a match is a reliable Classic
+# confirmation. Anything filtering on it must let unknown SKUs through,
+# or four out of five real testers would have been locked out.
+#
+# Docks, neither Classic nor Prime robots. Listed so an accessory SKU is
+# never mistaken for a robot of unknown generation.
+DOCK_SKU_PREFIXES: frozenset[str] = frozenset("481 482 483".split())
+
+
+# Matching happens on two characters; the tables above stay three so the
+# platform each entry came from remains identifiable. Derived here rather
+# than written out twice, because two hand-maintained copies of the same
+# list is how they drift apart.
+_PRIME_PREFIXES_2: frozenset[str] = frozenset(p[:2].upper() for p in PRIME_SKU_PREFIXES)
+_CLASSIC_PREFIXES_2: frozenset[str] = frozenset(c[:2].upper() for c in CLASSIC_SKU_PREFIXES)
+
+if _PRIME_PREFIXES_2 & _CLASSIC_PREFIXES_2:  # pragma: no cover - guarded by a test
+    raise AssertionError(
+        "Prime and Classic two-character prefixes overlap: "
+        f"{sorted(_PRIME_PREFIXES_2 & _CLASSIC_PREFIXES_2)}. Two characters is no longer "
+        "enough to tell the generations apart."
+    )
+
+
+def is_prime_sku(sku: str | None) -> bool:
+    """True for V4/Prime-generation SKUs.
+
+    Returns False for anything unrecognised, deliberately: an unknown
+    SKU is not evidence of Prime, and the table above is explicitly
+    incomplete for platforms nobody has field-tested. Callers should
+    read False as "not known to be Prime", not "confirmed Classic"."""
+    return sku is not None and sku[:2].upper() in _PRIME_PREFIXES_2
+
+
+def is_classic_sku(sku: str | None) -> bool:
+    """True for Classic-generation SKUs, from SkuUtils.java's table.
+
+    The counterpart to is_prime_sku(), and NOT its inverse -- there are
+    three answers here, not two:
+
+        is_prime_sku()    True  -> Prime
+        is_classic_sku()  True  -> Classic
+        both False              -> UNKNOWN, and that is a real answer
+
+    Unknown is the one worth handling deliberately. A caller that
+    filters with `not is_prime_sku(...)` treats unknown as Classic, and
+    will quietly route a Prime robot from a model nobody has catalogued
+    down the local-MQTT path -- which cannot work, and fails in a place
+    far from the cause.
+
+    Prefix matching is three characters because a single letter is
+    genuinely ambiguous: "R" is Prime in R285020 and Classic in
+    R980020.
+    """
+    return sku is not None and sku[:2].upper() in _CLASSIC_PREFIXES_2
+
+
+def sku_generation(sku: str | None) -> str:
+    """"prime", "classic", "dock", or "unknown".
+
+    Exists so callers stop having to combine two booleans and get the
+    unknown case right by accident. Prefer this in new code."""
+    if not sku:
+        return "unknown"
+    prefix = sku[:2].upper()
+    if prefix in _PRIME_PREFIXES_2:
+        return "prime"
+    if prefix in _CLASSIC_PREFIXES_2:
+        return "classic"
+    if sku[:3] in DOCK_SKU_PREFIXES:
+        return "dock"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class RobotLoginEntry:
+    """NEW (session 52) -- REPLACES the previous completely-unmodeled
+    `dict[str, Any]` shape of `LoginResult.robots`' per-BLID entries.
+    Found while doing a broader sweep of the `foundation/models`
+    package (a different one from `missioncommand`/`maps` covered by
+    prior sessions) -- CONFIRMED via `Robot$$serializer`'s `<clinit>`:
+    id, password, sku, softwareVer, name, cap (RobotCapabilities),
+    digiCap (RobotDigitalCapabilities), svcDeplId, user_cert.
+
+    `cap`/`digiCap` matching the exact top-level keys already seen in
+    real `get_state()` capture data (chairstacker's account) is a nice
+    independent cross-check that this is genuinely the same concept.
+
+    SECURITY NOTE: `password`/`user_cert` are genuine credential
+    material for this specific robot (distinct from the account-level
+    CloudCredentials/ConnectionToken) -- both marked `repr=False`,
+    following the same fix applied to CloudCredentials/ConnectionToken
+    in this same session, for the same reason (a default dataclass
+    repr would otherwise print them in plain text on any accidental
+    print()/log/traceback)."""
+
+    robot_id: str | None = None
+    password: str | None = field(default=None, repr=False)
+    sku: str | None = None
+    software_version: str | None = None
+    name: str | None = None
+    cap: RobotCapabilities | None = None
+    digi_cap: RobotDigitalCapabilities | None = None
+    svc_deployment_id: str | None = None
+    user_cert: str | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> RobotLoginEntry:
+        cap_raw = data.get("cap")
+        digi_cap_raw = data.get("digiCap")
+        return cls(
+            robot_id=data.get("id"),
+            password=data.get("password"),
+            sku=data.get("sku"),
+            software_version=data.get("softwareVer"),
+            name=data.get("name"),
+            cap=RobotCapabilities.from_json(cap_raw) if isinstance(cap_raw, dict) else None,
+            digi_cap=RobotDigitalCapabilities.from_json(digi_cap_raw) if isinstance(digi_cap_raw, dict) else None,
+            svc_deployment_id=data.get("svcDeplId"),
+            user_cert=data.get("user_cert"),
+        )
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """Everything extracted from a successful login — the raw response
+    is kept too, since callers may want fields this class doesn't
+    explicitly model (e.g. per-robot capability/state data).
+
+    Full evidence trail, correction history and open questions:
+    docs/internal/EVIDENCE_TRAIL.md#authloginresult
+    """
+
+    mqtt_endpoint: str
+    http_base: str
+    http_base_auth: str
+    credentials: CloudCredentials
+    robots: dict[str, RobotLoginEntry]
+    connection_tokens: list[ConnectionToken]
+    # repr=False SINCE 0.4.0: `raw` is the whole login response, and it
+    # carries every robot's password, the AWS SecretKey and SessionToken
+    # and the IoT tokens -- all of which the typed fields above keep out
+    # of their own repr. Printed as part of this object, `raw` put them
+    # all back: any `%r` in a log line, any pytest failure showing the
+    # object, any diagnostics dump. ha_roomba_plus once shipped a robot
+    # password into user logs exactly this way.
+    raw: dict[str, Any] = field(repr=False)
+    deployment: dict[str, Any] = field(default_factory=dict)
+    """NEW (session 41). The raw discovery-response deployment object
+    (`disc["deployments"][disc["current_deployment"]]`) -- previously a
+    local variable inside login(), discarded after use, meaning there was
+    no way to inspect it even when irbt_topic_prefix/iot_topic_prefix
+    guessing turned out wrong. A live test (chairstacker) confirmed
+    exactly that: both guessed keys came back missing. Captured here so
+    diagnostics.py can report the actual keys present, closing the loop
+    instead of guessing again without evidence."""
+    irbt_topic_prefix: str | None = None
+    iot_topic_prefix: str | None = None
+
+    def primary_token(self) -> ConnectionToken:
+        if not self.connection_tokens:
+            raise AuthError("Login succeeded but no connection_tokens were returned", self.raw)
+        return self.connection_tokens[0]
+
+    def token_for_blid(self, blid: str) -> ConnectionToken:
+        """Finds the connection_tokens entry whose devices list actually
+        covers this blid, falling back to primary_token() if none match.
+
+        This matters for multi-robot accounts: connection_tokens[0]
+        isn't necessarily the token for the robot the caller cares
+        about. Both real fixtures captured so far have exactly one
+        token covering exactly one device, so this distinction has
+        never actually been exercised against real data -- multi-robot
+        accounts are plausible but unconfirmed."""
+        for token in self.connection_tokens:
+            if blid in token.devices:
+                return token
+        return self.primary_token()
+
+    def primary_blid(self) -> str:
+        """The BLID to use when the caller didn't name one.
+
+        RAISES on a multi-robot account (this session, real field
+        report). This used to return next(iter(self.robots)) -- the
+        first key of a dict, which is arbitrary. On an account with two
+        robots it silently picked one and told nobody.
+
+        That is exactly what happened: a tester's region-command tests
+        went to the wrong robot for an entire session. The integration,
+        which asks for a specific BLID, was talking to the right one
+        the whole time -- so the two tools disagreed about which robot
+        was "the" robot, and nothing said so.
+
+        A wrong-but-plausible default is worse than an error here: the
+        command still sends, the robot still does nothing, and the
+        result looks like a protocol mystery instead of a
+        misconfiguration."""
+        if not self.robots:
+            raise AuthError(
+                "Login succeeded but no robots were returned", self.raw,
+                reason=CloudErrorReason.NO_ROBOTS,
+            )
+        if len(self.robots) > 1:
+            listed = "\n".join(
+                f"  --blid {blid}   {getattr(entry, 'name', None) or '(unnamed)'}"
+                f"  (sku {getattr(entry, 'sku', None) or '?'})"
+                for blid, entry in self.robots.items()
+            )
+            raise AuthError(
+                f"This account has {len(self.robots)} robots, so there is no single obvious "
+                f"target -- please name one explicitly:\n{listed}\n"
+                "Set --blid, or the ROOMBAPY_PRIME_BLID environment variable.",
+                self.raw,
+                reason=CloudErrorReason.ROBOT_AMBIGUOUS,
+            )
+        return next(iter(self.robots.keys()))
+
+
+def _discovery_url(country_code: str) -> str:
+    return f"https://disc-prod.iot.irobotapi.com/v1/discover/endpoints?country_code={country_code}"
+
+
+async def login(
+    session: aiohttp.ClientSession,
+    username: str,
+    password: str,
+    country_code: str,
+    app_id: str = _APP_ID,
+    *,
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> LoginResult:
+    """Run the full discovery -> Gigya -> iRobot cloud login chain.
+
+    Raises AuthError at whichever stage fails, with that stage's raw
+    response attached for diagnostics. Since 0.4.0 that holds for every
+    failure: a transport problem aiohttp reports in any form, and a
+    stage that takes longer than `request_timeout` seconds, are
+    AuthError subclasses too (see _raise_transport_error()).
+
+    UPDATE (this session): the discovery step is now served from an
+    in-memory cache when a recent-enough one exists for this
+    country_code -- see _get_discovery()'s own docstring for why this
+    specific response (unlike credentials) is safe to cache at all.
+    """
+    disc = await _get_discovery(session, country_code, request_timeout=request_timeout)
+
+    try:
+        deployment = disc["deployments"][disc["current_deployment"]]
+        gigya_cfg = disc["gigya"]
+    except (KeyError, TypeError) as exc:
+        raise AuthError(f"Unexpected discovery response shape, missing {exc}", disc) from exc
+    # EVERY SHAPE PROBLEM IS AN AuthError (0.4.0). The key lookups below
+    # were unchecked: a discovery without `httpBase`, or with a `gigya`
+    # block missing its api key, failed with a bare KeyError -- not an
+    # AuthError, so past every `except AuthError` and `except CloudError`.
+    if not isinstance(deployment, dict) or not isinstance(gigya_cfg, dict):
+        raise AuthError("Unexpected discovery response shape: deployment or gigya is not an object", disc)
+    for key in ("datacenter_domain", "api_key"):
+        if not gigya_cfg.get(key):
+            raise AuthError(f"No gigya {key} found in discovery response", disc)
+    http_base = deployment.get("httpBase")
+    if not http_base:
+        raise AuthError("No httpBase field found in discovery response", disc)
+
+    mqtt_endpoint = deployment.get("mqtt") or deployment.get("mqttApp") or deployment.get("mqttAts")
+    if not mqtt_endpoint:
+        raise AuthError("No mqtt endpoint field found in discovery response", disc)
+
+    http_base_auth = deployment.get("httpBaseAuth")
+    if not http_base_auth:
+        raise AuthError("No httpBaseAuth field found in discovery response", disc)
+
+    gigya_result = await _login_gigya(
+        session, gigya_cfg, username, password, request_timeout=request_timeout
+    )
+    login_result = await _login_irobot(
+        session, http_base, gigya_result, app_id, request_timeout=request_timeout
+    )
+
+    tokens_raw = login_result.get("connection_tokens") or []
+    if not isinstance(tokens_raw, list) or not all(isinstance(t, dict) for t in tokens_raw):
+        raise AuthError("connection_tokens in iRobot login response is not a list of objects", login_result)
+    connection_tokens = [ConnectionToken.from_json(t) for t in tokens_raw]
+
+    # Validate-at-the-gate (lesson from ha_roomba_plus's cloud_api.py):
+    # a response missing credentials should fail loudly here, not with
+    # a confusing KeyError deep inside a later REST call.
+    creds_raw = login_result.get("credentials")
+    if not creds_raw or not isinstance(creds_raw, dict):
+        raise AuthError("No credentials in iRobot login response", login_result)
+    for key in ("CognitoId", "AccessKeyId", "SecretKey", "SessionToken"):
+        if key not in creds_raw:
+            raise AuthError(f"Missing '{key}' in iRobot credentials response", login_result)
+    credentials = CloudCredentials.from_json(creds_raw)
+
+    raw_robots = login_result.get("robots") or {}
+    if not isinstance(raw_robots, dict) or not all(isinstance(v, dict) for v in raw_robots.values()):
+        raise AuthError("robots in iRobot login response is not an object of objects", login_result)
+    result = LoginResult(
+        mqtt_endpoint=mqtt_endpoint,
+        http_base=http_base,
+        http_base_auth=http_base_auth,
+        credentials=credentials,
+        robots={blid: RobotLoginEntry.from_json(v) for blid, v in raw_robots.items()},
+        connection_tokens=connection_tokens,
+        raw=login_result,
+        deployment=deployment,
+        # NAMES CONFIRMED TWICE OVER, so the "best-guess" note that used
+        # to sit here is gone: `irbtTopics` / `iotTopics`, plural
+        # "Topics", not "TopicPrefix" as originally guessed. First from
+        # @chairstacker's capture, then independently from the app's own
+        # service-discovery response
+        # (`GET /v1/robot/discover/{blid}` -> `{"iotTopics": "$aws",
+        # "irbtTopics": "v028-irbthbu"}`).
+        #
+        # STILL .get() RATHER THAN A GATE, but for a different reason
+        # than before. The name is no longer uncertain -- the VALUE is
+        # legitimately optional. It is deployment-dependent (v028, v029
+        # and v030 all seen in the wild), and the vendor's own app
+        # carries error causes for both being empty
+        # (`kEmptyIoTTopicPrefix`, `kEmptyIRBTTopicPrefix`), which is
+        # iRobot saying the same thing: expected at runtime, and
+        # sometimes absent.
+        #
+        # WHAT ITS ABSENCE COSTS, because it is not obvious from here:
+        # two topics -- and only two -- are built from it,
+        # `watch_live_map()` and `watch_mission_timeline()`. Both raise
+        # immediately when it is None, their retry loops back off to
+        # five minutes, and everything else keeps working because the
+        # shadow uses `$aws` and needs no prefix. The symptom is a live
+        # map that updates every few minutes instead of every few
+        # seconds, with no error anywhere a user can see
+        # (@chairstacker: every live-map counter at zero mid-mission,
+        # mission timeline empty).
+        #
+        # The two prefixes are NOT interchangeable. `$aws/things/{name}/`
+        # is reserved by AWS IoT for Shadow and Jobs; rrtp, timeline and
+        # cmd live under the irbt prefix. Publishing rrtp under `$aws`
+        # is a policy violation, and AWS answers one with SUBACK 0x80 or
+        # by closing the connection silently -- which reads like "the
+        # robot does not answer" and has already cost one round of field
+        # testing.
+        irbt_topic_prefix=deployment.get("irbtTopics"),
+        iot_topic_prefix=deployment.get("iotTopics"),
+    )
+    _LOGGER.info("roombapy-prime: authenticated, %d robot(s) found", len(result.robots))
+    return result
+
+
+#: Gigya's lockout code. 403041 is "Account temporarily locked out" in
+#: Gigya's published error table; 403042 next to it is a genuinely wrong
+#: password, which must keep asking for one.
+#:
+#: NUMBER FIRST, TEXT AS A FALLBACK. The code is stable and the message
+#: is localised -- an account whose Gigya profile is not English would
+#: return the same 403041 with words this cannot match. The text check
+#: exists only for the case where a future response carries wording and
+#: no code we recognise, and it is deliberately narrow: "locked" alone
+#: would also catch a phrase like "account locked permanently", which is
+#: not a wait-and-retry situation.
+_GIGYA_LOCKOUT_CODE = 403041
+_GIGYA_LOCKOUT_PHRASES = ("temporarily locked", "locked out")
+
+
+def _is_temporary_lockout(result: dict[str, object], message: str) -> bool:
+    """Whether Gigya refused this login because the account is locked.
+
+    Not because the password is wrong -- see the caller for why the
+    difference decides whether Home Assistant asks the owner to type it
+    again.
+    """
+    if result.get("errorCode") == _GIGYA_LOCKOUT_CODE:
+        return True
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in _GIGYA_LOCKOUT_PHRASES)
+
+
+async def _login_gigya(
+    session: aiohttp.ClientSession,
+    gigya_cfg: dict[str, Any],
+    username: str,
+    password: str,
+    *,
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> dict[str, str]:
+    base = f"https://accounts.{gigya_cfg['datacenter_domain']}/accounts."
+    payload = {
+        "loginMode": "standard",
+        "loginID": username,
+        "password": password,
+        "include": "profile,data,emails,subscriptions,preferences,",
+        "includeUserInfo": "true",
+        "targetEnv": "mobile",
+        "source": "showScreenSet",
+        "sdk": "ios_swift_1.3.0",
+        "sessionExpiration": "-2",
+        "apikey": gigya_cfg["api_key"],
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": _USER_AGENT_APP,
+    }
+    try:
+        async with asyncio.timeout(request_timeout):
+            async with session.post(
+                f"{base}login", headers=headers, data=urllib.parse.urlencode(payload)
+            ) as resp:
+                text = await resp.text()
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        _raise_transport_error(exc)
+
+    try:
+        result = json.loads(text)
+    except JSONDecodeError as exc:
+        raise AuthError(f"Invalid Gigya response (not JSON): {text[:300]}") from exc
+    if not isinstance(result, dict):
+        raise AuthError(f"Invalid Gigya response (not an object): {text[:300]}")
+
+    if result.get("errorCode", 0) != 0:
+        message = str(result.get("errorMessage", result))
+
+        # A LOCKOUT IS DETECTED AND SAID PLAINLY -- BUT IT STAYS A
+        # CREDENTIALS ERROR, and that is the opposite of what it looks
+        # like it should be.
+        #
+        # The obvious move is AuthRateLimitedError: a lockout is not a
+        # wrong password, it clears by itself, and the class exists.
+        # That was written, measured, and withdrawn.
+        #
+        # WHAT THE MEASUREMENT SAID. AuthRateLimitedError reaches Home
+        # Assistant as ConfigEntryNotReady, which retries on
+        # `2 ** min(tries, 4) * 5` seconds -- 5, 10, 20, 40, then 80
+        # forever. That is **11 login attempts per config entry in ten
+        # minutes**, and an account with two robots has two entries: 22
+        # attempts against an account that is locked *because of* too
+        # many attempts. AuthCredentialsError produces **zero**: Home
+        # Assistant stops and opens a reauth dialog.
+        #
+        # So the well-meaning fix would have hammered exactly the
+        # counter it was meant to relieve, and the harm scales with the
+        # number of robots -- the same thing that triggers the lockout
+        # in the first place.
+        #
+        # WHAT IS FIXED IS THE WORDING. @jpatchMC's log carried the real
+        # reason, but Home Assistant framed it as authentication needing
+        # attention, so he reset his password several times to rule out
+        # a wrong one -- each reset another attempt against a locked
+        # account. The message now says not to, in its first clause,
+        # where it survives truncation.
+        #
+        # WHAT WOULD ACTUALLY FIX THE CAUSE is one login shared across
+        # the config entries of one account rather than one per entry.
+        # See ha_roomba_plus's __init__.py, where the multiplier lives.
+        if _is_temporary_lockout(result, message):
+            raise AuthCredentialsError(
+                "Do not re-enter your password: this account is "
+                "temporarily locked after too many login attempts, and "
+                "it clears by itself, usually within minutes. Trying "
+                "again now can extend it. Disable the integration, wait "
+                f"ten minutes, then re-enable it. ({message})",
+                result,
+                reason=CloudErrorReason.ACCOUNT_LOCKED,
+            )
+
+        raise AuthCredentialsError(f"Gigya login failed: {message}", result)
+
+    try:
+        return {
+            "uid": result["UID"],
+            "signature": result["UIDSignature"],
+            "timestamp": result["signatureTimestamp"],
+        }
+    except KeyError as exc:
+        # Accepted, but without what the next stage needs -- a response
+        # problem, and until 0.4.0 a bare KeyError.
+        raise AuthError(f"Gigya login response is missing {exc}", result) from exc
+
+
+async def _login_irobot(
+    session: aiohttp.ClientSession,
+    http_base: str,
+    gigya: dict[str, str],
+    app_id: str,
+    *,
+    request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> dict[str, Any]:
+    payload = {
+        "app_id": app_id,
+        "app_info": {
+            "device_id": app_id,
+            "device_name": "python",
+            "language": "en_US",
+            "version": "7.16.2",
+        },
+        "assume_robot_ownership": "0",
+        "authorizer_params": {"devices_per_token": 5},
+        "gigya": {
+            "signature": gigya["signature"],
+            "timestamp": gigya["timestamp"],
+            "uid": gigya["uid"],
+        },
+        # Confirmed already present in cloud_api.py's existing payload —
+        # this is what makes connection_tokens appear in the response at
+        # all; omitting it silently drops the whole Custom Authorizer path.
+        "multiple_authorizer_token_support": True,
+        "push_info": {
+            "platform": "APNS",
+            "push_token": "0" * 64,
+            "supported_push_types": ["cr", "cse", "bf", "ae", "pm", "te", "dt"],
+        },
+        "skip_ownership_check": "0",
+    }
+    try:
+        async with asyncio.timeout(request_timeout):
+            async with session.post(
+                f"{http_base}/v2/login",
+                headers={"Content-Type": "application/json"},
+                json=payload,
+            ) as resp:
+                text = await resp.text()
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        _raise_transport_error(exc)
+
+    try:
+        result = json.loads(text)
+    except JSONDecodeError as exc:
+        raise AuthError(f"Invalid iRobot login response (not JSON): {text[:300]}") from exc
+    if not isinstance(result, dict):
+        raise AuthError(f"Invalid iRobot login response (not an object): {text[:300]}")
+
+    if result.get("errorCode"):
+        msg = result.get("errorMessage") or str(result)
+        # Known, real failure mode -- carried over 1:1 from cloud_api.py
+        # (confirmed there for the same /v2/login endpoint). Its own
+        # category (AuthRateLimitedError), not AuthCredentialsError --
+        # telling someone to re-check their password when the actual
+        # fix is "close the iRobot app and try again" would be
+        # actively misleading.
+        if "mqtt slot" in msg.lower():
+            raise AuthRateLimitedError(
+                f"Cloud auth rate-limited. Close the iRobot app and try again. ({msg})", result
+            )
+        raise AuthCredentialsError(f"iRobot cloud login failed: {msg}", result)
+
+    return result

@@ -1,0 +1,120 @@
+"""Factory: username/password/blid instead of a local IP (cloud client setup).
+
+STATUS: In field use. Naming convention deliberately mirrors
+roombapy.roomba_factory (RoombaFactory.create_roomba(...) ->
+PrimeFactory.create_prime_robot(...)) for recognizability -- see
+docs/internal/ROOMBAPY_COMPARISON.md section 4. Unlike roombapy's factory,
+this one is necessarily async, because establishing the connection
+needs a real login flow (roombapy doesn't need this since it works
+directly with a local IP + an already-known password).
+
+CONFIRMED: this is the entry point every field tester goes through --
+if the factory did not work, none of the confirmations elsewhere in
+this package would exist. It read "NOT tested against a real V4
+account" long after a dozen accounts had come through it.
+
+Pure wiring of already
+individually documented building blocks (auth.py, mqtt_client.py,
+rest_client.py, prime_robot.py).
+
+Also has an auto_refresh parameter (see below) for proactive token
+refresh -- see prime_robot.py's module docstring for the
+credentials-in-memory tradeoff that comes with it.
+"""
+from __future__ import annotations
+
+import aiohttp
+
+from .auth import LoginResult, login
+from .mqtt_client import PrimeMqttClient
+from .prime_robot import PrimeRobot, Relogin
+from .rest_client import PrimeRestClient
+
+
+class PrimeFactory:
+    """Analogous to roombapy.RoombaFactory, but async and account-based
+    instead of local-IP-based."""
+
+    @staticmethod
+    async def create_prime_robot(
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+        country_code: str,
+        blid: str | None = None,
+        *,
+        auto_refresh: bool = False,
+        login_result: LoginResult | None = None,
+        relogin: Relogin | None = None,
+    ) -> PrimeRobot:
+        """Logs in, selects the robot (first one found if blid isn't
+        given), wires up the MQTT and REST clients, returns a
+        NOT-YET-connected PrimeRobot instance -- the caller still needs
+        to await robot.connect() themselves.
+
+        auto_refresh=True: keeps username/password in the closure of a
+        relogin callback that's used two ways -- proactively by
+        PrimeRobot shortly before the MQTT token expires (see
+        prime_robot.py's module docstring for the credentials-in-memory
+        tradeoff that comes with this), AND reactively by
+        PrimeRestClient on an HTTP 403 on a p2maps call (see
+        rest_client.py). Default False -- previous behavior
+        (credentials expire after ~1h), no surprise for existing
+        callers of this method.
+
+        login_result: NEW (this session, prompted by a real
+        "onboarding is slow" field report). If the caller already has a
+        recent, still-valid LoginResult (e.g. ha_roomba_plus's
+        config_flow already ran one to validate credentials and list
+        robots, moments before this is called again for the real
+        setup), passing it here skips the internal login() call
+        entirely -- removing one full Gigya+iRobot login round-trip
+        that would otherwise be fully redundant. Left as None by
+        default: every existing caller keeps doing its own fresh
+        login, unchanged. The caller is responsible for deciding
+        whether a cached result is still fresh enough to reuse (this
+        method does not check an expiry itself, since it has no way to
+        know how the caller obtained or aged the result) -- see
+        ha_roomba_plus's own short-lived, single-use cache for the
+        actual freshness/reuse policy this parameter was built for.
+
+        relogin: the callback to renew with, instead of one holding this
+        robot's own credentials. CloudAccount.prime_robot() passes the
+        account's, so robots of one account share their logins (0.5.0b2).
+        Implies auto_refresh."""
+        if login_result is None:
+            login_result = await login(session, username, password, country_code)
+        target_blid = blid or login_result.primary_blid()
+        token = login_result.token_for_blid(target_blid)
+
+        mqtt_client = PrimeMqttClient(
+            token=token,
+            endpoint=login_result.mqtt_endpoint,
+            blid=target_blid,
+        )
+
+        # A relogin handed in -- CloudAccount's, shared by every robot of
+        # the account -- wins over one of the robot's own.
+        if relogin is None and auto_refresh:
+
+            async def _own_relogin() -> LoginResult:
+                return await login(session, username, password, country_code)
+
+            relogin = _own_relogin
+
+        rest_client = PrimeRestClient(
+            session=session,
+            http_base_auth=login_result.http_base_auth,
+            credentials=login_result.credentials,
+            relogin=relogin,
+        )
+
+        return PrimeRobot(
+            blid=target_blid,
+            robot_id=getattr(login_result.robots.get(target_blid), "robot_id", None),
+            mqtt_client=mqtt_client,
+            rest_client=rest_client,
+            relogin=relogin,
+            irbt_topic_prefix=login_result.irbt_topic_prefix,
+            deployment=login_result.deployment,
+        )

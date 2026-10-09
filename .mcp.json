@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vacuumgpt": {
+      "command": "/bin/sh",
+      "args": ["-c", "exec \"$HOME/.local/share/vacuumgpt/runtime/.venv/bin/python\" \"$HOME/.local/share/vacuumgpt/runtime/observer_mcp.py\""]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "VacuumGPT"
+  short_description: "Connect your Roomba to your agent"
+  default_prompt: "Use $vacuumgpt to check my Roomba and help it clean the requested rooms."

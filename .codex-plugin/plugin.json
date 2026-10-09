@@ -1,0 +1,12 @@
+{
+  "name": "vacuumgpt",
+  "version": "1.0.0",
+  "description": "Connect a Prime-generation Roomba to an agent with local status, maps, room cleaning and schedules.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "VacuumGPT",
+    "shortDescription": "Your Roomba, connected to your agent",
+    "defaultPrompt": ["What is my Roomba doing?", "Clean the kitchen."]
+  }
+}

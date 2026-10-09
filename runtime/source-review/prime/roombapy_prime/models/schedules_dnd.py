@@ -1,0 +1,671 @@
+"""Schedules and Do-Not-Disturb settings.
+
+Part of roombapy_prime.models (split into a package for navigability,
+session 55). See roombapy_prime/models/__init__.py for the full
+picture and docs/internal/PRIME_APP_GAP_ANALYSIS_2026-07-11.md for the
+evidence trail behind any individual field."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
+
+from .enums_common import _enum_or_none
+from .mission_control import RoutineCommand
+
+
+class ScheduleFrequency(StrEnum):
+    """Confirmed (jadx source, @SerialName per value, identical to the
+    enum name): only 4 values, no DAILY."""
+
+    BI_WEEKLY = "BI_WEEKLY"
+    MONTHLY = "MONTHLY"
+    ONCE = "ONCE"
+    WEEKLY = "WEEKLY"
+
+
+@dataclass(frozen=True)
+class ScheduleTime:
+    """Confirmed (androguard): day (List -- weekdays, the list content
+    type not resolvable via the bytecode field signature, presumably
+    int or string abbreviation like "MO"/"TU"), hour (Integer), min
+    (Integer).
+
+    CONFIRMED (session 57, real live response, chairstacker): "day" is
+    indeed a list of plain ints (e.g. [6], [1, 4]) -- weekday numbers,
+    not string abbreviations. The other hedged guess in this docstring
+    is now settled."""
+
+    day: list[Any] = field(default_factory=list)
+    hour: int | None = None
+    min: int | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"day": self.day}
+        if self.hour is not None:
+            body["hour"] = self.hour
+        if self.min is not None:
+            body["min"] = self.min
+        return body
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ScheduleTime:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(day=data.get("day") or [], hour=data.get("hour"), min=data.get("min"))
+
+
+@dataclass(frozen=True)
+class ScheduleDateEntry:
+    """Confirmed (jadx source, @SerialName per field, identical to the
+    property name): dayOfMonth, hour, min, month, year -- used for
+    ScheduleOptions.after/until (start/end date of a schedule)."""
+
+    day_of_month: int | None = None
+    hour: int | None = None
+    min: int | None = None
+    month: int | None = None
+    year: int | None = None
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ScheduleDateEntry:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            day_of_month=data.get("dayOfMonth"),
+            hour=data.get("hour"),
+            min=data.get("min"),
+            month=data.get("month"),
+            year=data.get("year"),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if self.day_of_month is not None:
+            body["dayOfMonth"] = self.day_of_month
+        if self.hour is not None:
+            body["hour"] = self.hour
+        if self.min is not None:
+            body["min"] = self.min
+        if self.month is not None:
+            body["month"] = self.month
+        if self.year is not None:
+            body["year"] = self.year
+        return body
+
+
+def _unwrap_commands(raw: Any) -> list[Any]:
+    """Command entries with their `{"command": ...}` wrapper removed.
+
+    SKIPS ANYTHING THAT IS NOT A DICT, and that is a fix rather than
+    caution. This was a bare comprehension calling .get() on every
+    entry, so a single null or string in the list raised AttributeError
+    -- from inside a parser, on a response the server sent.
+
+    The blast radius was the whole schedule parse: Home Assistant's
+    schedule calendar and every schedule switch read this, so one
+    malformed entry would have taken all of them down together. Same
+    shape as the SchedulesResponse.from_json crash fixed in b6, one
+    level further in.
+
+    Found by a test feeding malformed shapes at the layer above, which
+    is the only reason it turned up before a robot did it.
+    """
+    return [
+        entry.get("command", entry)
+        for entry in (raw if isinstance(raw, list) else [])
+        if isinstance(entry, dict)
+    ]
+
+
+@dataclass(frozen=True)
+class ScheduleOptions:
+    """A schedule's settings.
+
+    ALL SIXTEEN FIELDS MATCH the app's own ScheduleOptions, confirmed by
+    APK analysis: robot_id, name, enabled, frequency, start, end,
+    commands, end_commands, after, until, append, exclude, reminder,
+    deleted, force_cloud, created_time.
+
+    NOTHING IS REQUIRED IN KOTLIN -- every field there is nullable, so
+    the server decides what a valid schedule needs. That explains the
+    HTTP 500 a tester saw: a schedule carrying only `name` and `enabled`
+    is syntactically fine and semantically meaningless, and the server
+    refused it rather than storing a schedule with no robot, no days and
+    no commands.
+
+    So there is no client-side validation to add here. The tooling
+    derives a new schedule from an existing one instead of building one
+    from literals, which is the only reliable way to produce something
+    the server accepts.
+
+    CORRECTED (session 46): real wire keys directly confirmed via
+    the `ScheduleOptions$$serializer` companion class's `<clinit>`
+    (the same technique that resolved RobotStatusV2 in session 40) --
+    a stronger basis than the previous "no @SerialName found, presumed
+    = Kotlin property name" guess, which turned out WRONG for four of
+    the 17 fields: `robot_id` (not `assetId`), `end_commands` (not
+    `endCommands`), `created_time` (not `createdTime`), `force_cloud`
+    (not `forceCloud`) -- snake_case, matching the pattern seen almost
+    everywhere else in this library's confirmed real data, not the
+    camelCase originally guessed. The remaining 13 fields (name,
+    frequency, start, end, after, until, commands, enabled, deleted,
+    reminder, append, exclude) were already correct.
+
+    UNCERTAINTY: commands/end_commands are only recognizable as "List"
+    via the raw bytecode field signature (Java generics type erasure
+    at runtime) -- modeled here as List[RoutineCommand], in strong
+    analogy to FavoriteV1.command_defs (the same pattern: a schedule
+    triggers a RoutineCommand when it fires), but NOT directly
+    confirmed via a generic signature. append/exclude similarly
+    uncertain (content unknown, left here as a raw list).
+
+    CONFIRMED (session 57, real live get_schedules() response,
+    chairstacker): each commands/end_commands entry is wrapped as
+    {"command": {...RoutineCommand-shaped...}}, NOT a bare
+    RoutineCommand dict as previously assumed -- to_json() corrected
+    to add this wrapper (a genuine bug: the previous, unwrapped output
+    would very likely have been rejected or misinterpreted by the
+    real create/update schedule endpoints, never tested live before
+    now). Also confirms ScheduleTime.day is indeed a list of plain
+    ints (weekday numbers), settling that field's own hedged guess."""
+
+    #: Serialises as `robot_id` on the wire -- confirmed against the
+    #: app's own ScheduleOptions field list. The attribute keeps the
+    #: name `asset_id` because that is what the REST paths and the
+    #: mission-command domain call the same value; renaming it here
+    #: would make the two halves of this library disagree.
+    asset_id: str | None = None
+    name: str | None = None
+    frequency: ScheduleFrequency | None = None
+    start: ScheduleTime | None = None
+    end: ScheduleTime | None = None
+    after: ScheduleDateEntry | None = None
+    until: ScheduleDateEntry | None = None
+    commands: list[RoutineCommand] = field(default_factory=list)
+    end_commands: list[RoutineCommand] = field(default_factory=list)
+    append: list[Any] = field(default_factory=list)
+    exclude: list[Any] = field(default_factory=list)
+    created_time: str | None = None
+    deleted: bool | None = None
+    enabled: bool | None = None
+    force_cloud: bool | None = None
+    reminder: int | None = None
+    #: EVERYTHING THE SERVER SENT THAT THIS MODEL DOES NOT NAME.
+    #
+    # The server is ahead of the app it was reverse-engineered from:
+    # `is_smart_clean_fav` arrives on real schedules and appears nowhere
+    # in APK 2.2.4, neither in Kotlin nor natively (APK research 10).
+    #
+    # APP 3.0.0 HAS CAUGHT UP: `ScheduleOptionsDto` now declares
+    # `is_smart_clean_fav` as one of its thirteen fields. The server was
+    # not ahead by accident -- the app has since been rebuilt around it.
+    #
+    # Not promoted to a named field. It arrives, round-trips and is
+    # returned unchanged either way, and naming it would mean deciding a
+    # type and a default for something nothing here reads. If a caller
+    # ever needs it, the confirmation to build on is in place.
+    #
+    # THE MECHANISM IS WHAT MATTERED, and it held: a field the model did
+    # not know survived a read-modify-write cycle for as long as it took
+    # the vendor's own client to declare it.
+    #
+    # FIVE FIELDS WENT THE OTHER WAY IN THE SAME RELEASE. A structural
+    # diff of 2.2.4 against 3.0.0 shows `ScheduleOptions` losing
+    # `after`, `append`, `exclude`, `reminder` and `until` while gaining
+    # `is_smart_clean_fav` and `schedule_id`. The vendor's current model
+    # declares thirteen fields and none of those five is among them.
+    #
+    # THEY ARE KEPT, AND THE DIFF SAYS LESS THAN IT LOOKS. What a client
+    # stopped sending is a fact about that client. The endpoint is the
+    # server's, and the server keeps accepting fields long after an app
+    # stops using them -- there is no reason for it to break its own
+    # older clients.
+    #
+    # THIS FILE CARRIES THE COUNTER-EXAMPLE, four paragraphs up.
+    # `is_smart_clean_fav` arrived on real schedules while appearing
+    # NOWHERE in 2.2.4. The server was ahead of the app then; assuming
+    # it now follows the app is the same error with the sign flipped.
+    #
+    # So the diff is a hint about where to look if something breaks, not
+    # a prediction that it will. Every one of the five is written only
+    # when a caller sets it explicitly, and nothing in this project
+    # does, so no request in the field carries any of them today.
+    #
+    # WHAT WOULD ACTUALLY SETTLE IT is a write that carries one and is
+    # accepted or refused. Nothing short of that is evidence about the
+    # server.
+    #
+    # HOW THIS WAS FOUND is worth recording too: not by reading the
+    # research prose, which was read in full, but by opening
+    # `v3_diff_224_300.json` -- one of seventeen files in the package
+    # nobody had opened at all. Coverage of the extracted DATA was
+    # measured repeatedly; coverage of the extract's own FILE LIST was
+    # not.
+    #
+    # Writing a schedule is read-modify-write. Without this, every write
+    # silently drops whatever the server knows and the app does not --
+    # and the loss is invisible, because the request is accepted and the
+    # field simply stops coming back.
+    #
+    # Kept opaque on purpose: nothing here needs to be understood, only
+    # returned unchanged.
+    unknown_fields: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        # The unknown ones FIRST, so a named field always wins if the
+        # two ever collide -- our understanding of a key we model should
+        # not be overwritten by a stale copy of it.
+        body: dict[str, Any] = dict(self.unknown_fields)
+        if self.asset_id is not None:
+            body["robot_id"] = self.asset_id
+        if self.name is not None:
+            body["name"] = self.name
+        if self.frequency is not None:
+            body["frequency"] = self.frequency.value
+        if self.start is not None:
+            body["start"] = self.start.to_json()
+        if self.end is not None:
+            body["end"] = self.end.to_json()
+        if self.after is not None:
+            body["after"] = self.after.to_json()
+        if self.until is not None:
+            body["until"] = self.until.to_json()
+        if self.commands:
+            body["commands"] = [
+                {"command": c.to_json() if hasattr(c, "to_json") else c} for c in self.commands
+            ]
+        if self.end_commands:
+            body["end_commands"] = [
+                {"command": c.to_json() if hasattr(c, "to_json") else c} for c in self.end_commands
+            ]
+        if self.append:
+            body["append"] = self.append
+        if self.exclude:
+            body["exclude"] = self.exclude
+        if self.created_time is not None:
+            body["created_time"] = self.created_time
+        if self.deleted is not None:
+            body["deleted"] = self.deleted
+        if self.enabled is not None:
+            body["enabled"] = self.enabled
+        if self.force_cloud is not None:
+            body["force_cloud"] = self.force_cloud
+        if self.reminder is not None:
+            body["reminder"] = self.reminder
+        return body
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> ScheduleOptions:
+        """NEW -- added specifically to support verify_schedule_write.py's
+        stage 1 ("resend an existing schedule completely unchanged").
+        commands/end_commands are deliberately NOT parsed into
+        RoutineCommand objects here (no RoutineCommand.from_json()
+        exists in this library yet) -- each entry's inner "command"
+        dict is kept as a raw dict instead, which to_json() above
+        already tolerates (matching the same has_json/raw-dict escape
+        hatch RoutineCommand.to_json() itself uses for its own
+        params/regions/id_multipolys fields). Safe for an unchanged
+        round-trip specifically because nothing here needs to be
+        understood, only preserved byte-for-byte."""
+        if not isinstance(data, dict):
+            return cls()
+        # The sixteen `@SerialName` keys of ScheduleOptions, confirmed
+        # from the app's own `$$serializer` `<clinit>` block. Anything
+        # else the server sends is carried through untouched.
+        known = {
+            "robot_id", "name", "frequency", "start", "end", "after",
+            "until", "commands", "end_commands", "append", "exclude",
+            "created_time", "deleted", "enabled", "force_cloud", "reminder",
+        }
+        extras = {k: v for k, v in data.items() if k not in known}
+
+        start_data = data.get("start")
+        end_data = data.get("end")
+        after_data = data.get("after")
+        until_data = data.get("until")
+        return cls(
+            unknown_fields=extras,
+            asset_id=data.get("robot_id"),
+            name=data.get("name"),
+            frequency=_enum_or_none(ScheduleFrequency, data.get("frequency")),
+            start=ScheduleTime.from_json(start_data) if start_data else None,
+            end=ScheduleTime.from_json(end_data) if end_data else None,
+            after=ScheduleDateEntry.from_json(after_data) if after_data else None,
+            until=ScheduleDateEntry.from_json(until_data) if until_data else None,
+            commands=_unwrap_commands(data.get("commands")),
+            end_commands=_unwrap_commands(data.get("end_commands")),
+            append=data.get("append") or [],
+            exclude=data.get("exclude") or [],
+            created_time=data.get("created_time"),
+            deleted=data.get("deleted"),
+            enabled=data.get("enabled"),
+            force_cloud=data.get("force_cloud"),
+            reminder=data.get("reminder"),
+        )
+
+
+@dataclass(frozen=True)
+class HouseholdSchedule:
+    """CORRECTED (session 46): confirmed directly from
+    `HouseholdSchedule$$serializer`'s `<clinit>` -- real key is
+    `schedule_id` (snake_case), not `scheduleId` as previously guessed
+    from the androguard field name alone. `options` was already
+    correct. Used per SchedulesAPI for updateSchedules()
+    (List<HouseholdSchedule>)."""
+
+    schedule_id: str
+    options: ScheduleOptions
+
+    def to_json(self) -> dict[str, Any]:
+        return {"schedule_id": self.schedule_id, "options": self.options.to_json()}
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> HouseholdSchedule:
+        """NEW -- see ScheduleOptions.from_json()'s own entry in docs/internal/EVIDENCE_TRAIL.md for
+        why commands/end_commands round-trip as raw dicts rather than
+        parsed RoutineCommand objects."""
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            # 3.0.0 MOVED THE ID INSIDE THE OPTIONS.
+            #
+            # The 2.2.4 envelope carried `schedule_id` beside `options`;
+            # `ScheduleOptionsDto` in 3.0.0 declares it as one of its own
+            # thirteen keys, and `HouseholdScheduleDto` now holds a
+            # `schedules` list plus a `household_schedule_id`.
+            #
+            # Both placements are read. A schedule whose id we cannot
+            # find is a schedule nobody can edit or delete -- Home
+            # Assistant matches calendar events on it -- and that failure
+            # would look like an empty calendar rather than a parse
+            # error.
+            schedule_id=(
+                data.get("schedule_id")
+                or (data.get("options") or {}).get("schedule_id")
+                or ""
+            ),
+            options=ScheduleOptions.from_json(data.get("options") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class HouseholdScheduleUpdate:
+    """CORRECTED (session 46): confirmed directly from
+    `HouseholdScheduleUpdate$$serializer`'s `<clinit>` -- identical
+    field shape to HouseholdSchedule (`schedule_id`, `options`, both
+    snake_case) -- a separate class exists in the bytecode, presumably
+    for a more specific update context, but the distinction from
+    HouseholdSchedule wasn't further resolved."""
+
+    schedule_id: str
+    options: ScheduleOptions
+
+    def to_json(self) -> dict[str, Any]:
+        return {"schedule_id": self.schedule_id, "options": self.options.to_json()}
+
+
+@dataclass(frozen=True)
+class SchedulesList:
+    """NEW (session 51). CONFIRMED via SchedulesList$$serializer:
+    household_schedule_id, schedules (a list of HouseholdSchedule,
+    presumably -- the generic list element type isn't resolvable via
+    the bytecode field signature, but this is the only plausible
+    reading given the surrounding class family)."""
+
+    household_schedule_id: str | None = None
+    schedules: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> SchedulesList:
+        if not isinstance(data, dict):
+            return cls()
+        # `schedules` is checked for being a list for the same reason
+        # SchedulesResponse.from_json() checks its own -- see there.
+        schedules = data.get("schedules")
+        return cls(
+            household_schedule_id=data.get("household_schedule_id"),
+            schedules=schedules if isinstance(schedules, list) else [],
+        )
+
+
+@dataclass(frozen=True)
+class SchedulesResponse:
+    """NEW (session 51) -- the confirmed TOP-LEVEL envelope for
+    get_schedules(), previously entirely unmodeled ("Response shape
+    (SchedulesList) not modeled -- raw JSON" -- that docstring had
+    already found the CLASS NAME, just not its fields). CONFIRMED via
+    SchedulesResponse$$serializer: household_schedules (a list of
+    SchedulesList, by the same naming-analogy reasoning)."""
+
+    household_schedules: list[SchedulesList] = field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> SchedulesResponse:
+        """FOUND IN THE b6 BUG HUNT. `data.get("household_schedules")`
+        was iterated without checking it is a list: a dict there yields
+        its KEYS, and SchedulesList.from_json() then called .get() on a
+        string. AttributeError, from a parser, on a response the server
+        sent.
+
+        Not hypothetical in the way it sounds -- an error envelope or a
+        changed response shape reaches exactly this line, and it is on
+        the path HA's schedule calendar and switches use. A parser's job
+        on an unexpected shape is to return nothing, not to raise."""
+        raw = data.get("household_schedules") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return cls()
+        return cls(household_schedules=[
+            SchedulesList.from_json(s) for s in raw if isinstance(s, dict)
+        ])
+
+
+@dataclass(frozen=True)
+class DNDStatusResponse:
+    """CONFIRMED (session 46, via `DNDStatusResponse$$serializer`'s
+    `<clinit>` -- the same technique that resolved ScheduleOptions'
+    wrong field names in this same session): dailyStart/dailyEnd
+    (Integer, presumably minutes since midnight), endsAt (Long,
+    presumably epoch millis for a one-time DND exception), status
+    (Map -- structure not investigated). All four keys already matched
+    what this class's from_json() used -- unlike ScheduleOptions, no
+    fix was needed here, just confirmation. IMPORTANT: DNDSchedule (the
+    sealed-class variant with DailySchedule/EndsAt as separate types)
+    and DNDStatusResponse (this flat class) are TWO DIFFERENT
+    representations -- DNDStatusResponse is likely the actual GET
+    response shape (directly referenced by DNDGetRequest callers),
+    DNDSchedule is more likely internal for building the PUT request."""
+
+    daily_start: int | None = None
+    daily_end: int | None = None
+    ends_at: int | None = None
+    status: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> DNDStatusResponse:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            daily_start=data.get("dailyStart"),
+            daily_end=data.get("dailyEnd"),
+            ends_at=data.get("endsAt"),
+            status=data.get("status") or {},
+        )
+
+
+@dataclass(frozen=True)
+class DNDDailySchedule:
+    """NEW (session 46). Confirmed directly from
+    `DNDSchedule$DailySchedule$$serializer`'s `<clinit>`: dailyStart,
+    dailyEnd (both camelCase, matching DNDStatusResponse's own
+    confirmed keys for the same concept). This is one of two variants
+    of the `DNDSchedule` sealed class used for building the PUT
+    request body -- the other is `DNDEndsAt`.
+
+    THE ENVELOPE QUESTION IS ANSWERED (APK, 2 August 2026): there is
+    no envelope and no discriminator. DNDPutRequest serialises the
+    variant DIRECTLY --
+
+        Json.Default.encodeToString(DNDSchedule.Companion.serializer(), body)
+
+    -- so the body is exactly this object's own two fields, and
+    Json.Default means no encodeDefaults: a field left at its default
+    is omitted rather than sent as null. Same serialisation rule as
+    CreateSchedulesRequest.
+
+    That caveat was why these two classes sat unused while the write
+    path built its own dict instead. The dict mixed BOTH variants and
+    added `status`, which belongs to the response side and is not part
+    of DNDSchedule at all -- and it used the Python attribute names
+    (daily_start) rather than the wire keys (dailyStart). Three faults
+    in one body, which is the HTTP 400 the one live attempt returned.
+
+    MINUTES SINCE MIDNIGHT, range 0-1439 (APK, 2 August 2026). The
+    formula is in machine code, in ScheduleDataUtils::
+    doScheduleConflicts:
+
+        hour * 60 + minute            22:00 -> 1320,  07:30 -> 450
+
+    That fits the type split exactly: an int is ample for 0-1439, while
+    DNDEndsAt needs a long for a real timestamp.
+
+    ONE CAVEAT, deliberately left in. The formula was read out of the
+    general schedule-conflict check, not out of the DND serialisation
+    path itself. Both operate on the same CoreTimeWindow objects
+    (getStartHour/getStartMinute/getEndHour/getEndMinute), so carrying
+    it across is well-founded rather than proven.
+
+    `roombapy-prime-verify-writes dnd_read` prints each value with its
+    minutes-since-midnight reading beside it, so the first tester with
+    quiet hours set confirms or refutes this by glancing at their own
+    app -- no arithmetic, no second round."""
+
+    daily_start: int
+    daily_end: int
+
+    @classmethod
+    def from_clock(
+        cls, start_hour: int, start_minute: int, end_hour: int, end_minute: int
+    ) -> DNDDailySchedule:
+        """Builds the pair from clock times, so callers do not repeat
+        the conversion and get it subtly wrong.
+
+        Raises rather than clamping on an out-of-range time: a quiet
+        period silently shifted to a different hour is worse than a
+        refusal, and this writes to a real robot."""
+        for hour, minute in ((start_hour, start_minute), (end_hour, end_minute)):
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"not a clock time: {hour}:{minute}")
+        return cls(
+            daily_start=start_hour * 60 + start_minute,
+            daily_end=end_hour * 60 + end_minute,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {"dailyStart": self.daily_start, "dailyEnd": self.daily_end}
+
+
+@dataclass(frozen=True)
+class DNDEndsAt:
+    """NEW (session 46). Confirmed directly from
+    `DNDSchedule$EndsAt$$serializer`'s `<clinit>`: endsAt (Long,
+    presumably epoch millis, matching DNDStatusResponse's own
+    confirmed key for the same concept) -- the other of the two
+    `DNDSchedule` variants.
+
+    NEVER SENT ALONGSIDE dailyStart/dailyEnd. DNDSchedule is a sealed
+    class with exactly these two cases, so the app's own type system
+    makes a body carrying both impossible -- and a server has never
+    been asked to accept one. See DNDDailySchedule for the envelope,
+    which is confirmed to be none at all."""
+
+    ends_at: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {"endsAt": self.ends_at}
+
+
+
+
+@dataclass(frozen=True)
+class Automation:
+    """One third-party or geofence trigger. NOT a schedule.
+
+    WIRE KEYS from AutomationProvider::parseRoutineJson via
+    RoutineConstants (APK, 2 August 2026). Confirmed as literals in
+    liblegacyCore.so: automation_id, automation_type, automation_source,
+    time_window, service_details, service_id, trigger_id,
+    robot_commands, favorite_id. Resolved through constants rather than
+    their own literals: enabled, one_time, days, hour, minute.
+
+    `automation_type` arrives as a string and the app maps it through
+    automationStringToTypeMap; that map's contents were not read out, so
+    the value is kept as sent rather than parsed into an enum.
+
+    `service_details` identifies the partner: hard-coded ids exist for
+    August Home, Ecobee, Leviton, MyQ and Wyze, alongside a location
+    service for geofencing.
+
+    `robot_commands` is left raw. It carries the same command
+    structures favourites use, and those have their own confirmed
+    models -- but nothing was read out at THIS call site to say the
+    nesting matches, and assuming it does is how wire keys go wrong.
+    """
+
+    automation_id: str | None = None
+    automation_type: str | None = None
+    automation_source: str | None = None
+    enabled: bool | None = None
+    one_time: bool | None = None
+    days: list[Any] = field(default_factory=list)
+    time_window: dict[str, Any] | None = None
+    service_details: dict[str, Any] | None = None
+    favorite_id: str | None = None
+    robot_commands: list[Any] = field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> Automation:
+        if not isinstance(data, dict):
+            return cls()
+        days = data.get("days")
+        commands = data.get("robot_commands")
+        return cls(
+            automation_id=data.get("automation_id"),
+            automation_type=data.get("automation_type"),
+            automation_source=data.get("automation_source"),
+            enabled=data.get("enabled"),
+            one_time=data.get("one_time"),
+            days=days if isinstance(days, list) else [],
+            time_window=data.get("time_window"),
+            service_details=data.get("service_details"),
+            favorite_id=data.get("favorite_id"),
+            robot_commands=commands if isinstance(commands, list) else [],
+        )
+
+
+def parse_automations(data: Any) -> list[Automation]:
+    """Whatever shape /v1/user/automations turns out to return.
+
+    NOBODY HAS SEEN A RESPONSE. The endpoint is a dead constant in the
+    app -- one reference, a static initialiser, no reader -- and its
+    real path lies behind the Djinni boundary. So the container is
+    unknown: a bare list is as likely as a dict wrapping one.
+
+    Both are accepted, and anything else yields nothing rather than
+    raising. Guessing at a wrapper key would be inventing structure,
+    which is exactly what this project does not do; accepting the two
+    shapes it could plausibly be costs nothing and hides nothing,
+    because the check that calls this prints the raw response first.
+    """
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        found = next(
+            (value for value in data.values() if isinstance(value, list)), None
+        )
+        entries = found if found is not None else []
+    else:
+        return []
+    return [
+        Automation.from_json(entry) for entry in entries if isinstance(entry, dict)
+    ]

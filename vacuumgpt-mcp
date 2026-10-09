@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+ROO_APP="${VACUUMGPT_HOME:-$HOME/.local/share/vacuumgpt}"
+if [ ! -x "$ROO_APP/runtime/.venv/bin/python" ]; then
+  echo 'VacuumGPT is not installed. Run Install.command from the download first.' >&2
+  exit 1
+fi
+exec "$ROO_APP/runtime/.venv/bin/python" "$ROO_APP/runtime/observer_mcp.py"
