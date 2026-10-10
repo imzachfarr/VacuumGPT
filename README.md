@@ -20,9 +20,12 @@ The installer downloads uv/Python and pinned dependencies, saves credentials in 
 - Named-room and multiroom cleaning, with exact map/region checks and no whole-house fallback.
 - Local schedules with your timezone, durable command receipts and interruption history.
 - A local dashboard at http://127.0.0.1:8766/.
-- Optional bounded recovery of fault-free paused missions started through VacuumGPT.
+- Optional bounded recovery of fault-free paused missions started through VacuumGPT, with durable attempts and preserved room intent.
+- Filtered fault diagnostics and one explicitly requested normal brush-resume attempt after physical inspection, subject to onboard protection.
 
 Vendor room names load automatically. If the map has unnamed rooms, your agent can show the map and save the aliases you choose. Advanced settings, room order and physical cleaning boundaries depend on hardware. Broker acknowledgement alone does not prove a cleaning action or coverage.
+
+Recovery requires an unchanged native mission and map, fresh ready state, a positively known pause origin and remaining retry budget. Explicit pause/stop/dock, unknown pauses, active faults and ended missions block automatic recovery. A durable outbox keeps queued attempts across a Mac restart; possibly dispatched attempts are never replayed. Read [RECOVERY.md](RECOVERY.md) for the exact recovery and brush-inspection limits.
 
 Experimental spot-boundary and garbage-can movement are disabled. Area and location saving are non-moving drafts. The software cannot remove physical faults or reconstruct a lost onboard cleaning plan.
 
@@ -33,6 +36,10 @@ The included stdio MCP server is the actual connector. Codex, Claude Desktop and
 The bundle also includes `.codex-plugin/plugin.json` and `.mcp.json` for plugin packaging. Choose either plugin-provided MCP wiring or standalone registration; do not enable both copies. Device setup must run once before the plugin server can start. The bundle is a local connector, not a hosted ChatGPT web connector or an approved marketplace listing.
 
 The runtime lives at `~/.local/share/vacuumgpt/runtime`. The download can be deleted after installation. The Mac must stay awake and online for observation, schedules and recovery. Missed, busy, faulted, stale or map-changed scheduled runs are skipped. Notification polling does not wake an idle chat.
+
+## Source updates
+
+The changes under `Unreleased` in [CHANGELOG.md](CHANGELOG.md) are available in this repository. The published `v1.0.0` download remains the release bundle. Running the installer again for an existing installation refreshes agent registration; it does not replace that installation's runtime or existing skill. Keep existing credentials, selected identity, private data and owner grants separate from a source update.
 
 ## Diagnose or remove
 

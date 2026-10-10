@@ -24,10 +24,20 @@ def target(snapshot):
     if radius<.02:raise c.ControlError('MoveGarbageCanPinFurtherInsideOpenFloor')
     ring=[[point[0]+radius*math.cos(i*math.tau/24),point[1]+radius*math.sin(i*math.tau/24)] for i in range(24)]
     details=prepare(snapshot,loc['map_id'],loc['map_version'],ring,loc['snapshot_id'],'vacuum')
+    current=c.read_local('/api/map/'+str(details['map_snapshot_id']))
+    rooms=[f for f in features(file(current,'rooms.geojson')) if f.get('geometry',{}).get('type') in ('Polygon','MultiPolygon') and shape(f['geometry']).covers(Point(point))]
+    if len(rooms)!=1 or rooms[0].get('id') is None:raise c.ControlError('GarbageCanRequiresUnambiguousMappedRoom')
+    rid=str(rooms[0]['id'])
+    c.validate_retained_region(snapshot,details['map_id'],details['map_version'],rid)
+    from room_labels import room_name
     return {**details,'destination':point,'location_revision':loc['revision'],'operating_mode':2,'mode':'vacuum',
-            'effect':'Vacuum toward the garbage can, then pause on observed arrival; vacuum may run briefly'}
+            'navigation_method':'mapped_room_approach','region_id':rid,'room':room_name(details['map_id'],rid),
+            'effect':'Approach the mapped room containing the garbage can, then pause; exact bin arrival is unverified'}
 
 def distance(status,plan,mission,started):
+    # Live frames lack an independently verified saved-map coordinate transform.
+    # A room approach must never claim bin arrival from the inferred map label.
+    if plan.get('navigation_method')=='mapped_room_approach':return None
     p=status.get('pose') or {};d=p.get('data') or {};points=d.get('points') or []
     if status.get('pose_stale') or p.get('age_seconds',999)>8 or p.get('at',0)<started or p.get('mission')!=mission or d.get('map_id')!=plan['map_id'] or not points:return None
     q=points[-1]
@@ -52,7 +62,8 @@ async def run(plan,robot,blid,raw_publish):
     owner=asyncio.current_task();stage='start';sent=set();pid=plan['plan_id'];started=time.time();mission=None
     clean=plan
     data={'action':'drive_garbage','destination':plan['destination'],'arrival_confirmed':False,'robot_action_confirmed':False,
-          'vacuum_may_run':True,'may_have_executed':False,'outcome':'validating','mqtt_owner':'observer_session'}
+          'vacuum_may_run':True,'may_have_executed':False,'outcome':'validating','mqtt_owner':'observer_session',
+          'navigation_method':plan.get('navigation_method','native_point_clean_then_pause'),'room':plan.get('room')}
     async def publish(t,p,timeout=5):
         if t!=topic:
             from roombapy_prime.mqtt_client import _shadow_base

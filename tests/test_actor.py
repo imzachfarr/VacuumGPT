@@ -66,6 +66,22 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('error_code',denied)
         self.assertEqual(len(calls),3)
 
+    async def test_fault_diagnostic_fixed_reads_are_filtered_and_never_write(self):
+        calls=[]
+        async def shadow(name):
+            calls.append(name)
+            return SimpleNamespace(payload={'state':{'reported':{'password':'must-not-return',
+                'lastCommand':{'command':'reset','time':100,'password':'also-private'},
+                'connected':True,'softwareVer':'fixture','cleanMissionStatus':{'error':0,'phase':'stop','token':'private'}}},
+                'metadata':{'reported':{'cleanMissionStatus':{'error':{'timestamp':100}}}}})
+        self.robot.get_named_shadow=shadow
+        answer=await self.request({'diagnostic':'fault_read'})
+        self.assertTrue(answer['read_only']);self.assertEqual(calls,['ro-currentstate','rw-software','rw-constatus','ro-stats'])
+        self.assertEqual(answer['shadows']['ro-currentstate']['error_reported_at'],100)
+        self.assertEqual(answer['shadows']['rw-software']['last_command'],{'command':'reset','time':100})
+        self.assertNotIn('private',json.dumps(answer));self.assertNotIn('must-not-return',json.dumps(answer))
+        self.raw_publish.assert_not_awaited()
+
     async def test_voice_diagnostic_failure_does_not_expose_raw_exception(self):
         async def shadow(name):raise RuntimeError('private token value')
         self.robot.get_named_shadow=shadow
@@ -116,23 +132,41 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recovery_through_actor_resumes_same_mission_without_start(self):
         import mission_monitor
+        import recovery_store
+        import recovery_context
+        import map_recovery
         now=time.time()
-        current={'batPct':80,'cleanMissionStatus':{'phase':'pause','error':0,'notReady':0,'condNotReady':[],
-            'missionId':'same','initiator':'localApp','cycle':'clean'}}
+        geometry={'map_id':'map','version':'v2','topology_hash':'verified','region_ids':['13']}
+        current={'batPct':80,'p2maps':[{'p2map_id':'map','p2mapv_id':'v2'}],
+            'cleanMissionStatus':{'phase':'pause','error':0,'notReady':0,'condNotReady':[],
+            'missionId':'same','initiator':'localApp','cycle':'clean','mssnStrtTm':int(now-120),'nMssn':1,'operatingMode':32}}
+        phase_at=int(now-50)
+        software={'state':{'reported':{'lastCommand':{'command':'pause','initiator':'robot','time':phase_at}}}}
+        connection={'state':{'reported':{'connected':True}}}
+        state_payload={'state':{'reported':current},'metadata':{'reported':{'cleanMissionStatus':{'phase':{'timestamp':phase_at}}}}}
+        current=recovery_context.enrich(current,state_payload,software,connection,geometry)
         snapshot={**self.snapshot,'state':{'data':current}}
         (self.root/'observer-data/control-policy.json').write_text(json.dumps({'automatic_resume':True}))
-        c.save_job('same',{'mission_id':'same','started_at':now-120,'pause_since':now-60,'held':False,'finished':False,
-            'automatic_resume':True,'resume_count':1,'last_resume_at':now,'room':'Kitchen'})
-        states=[current['cleanMissionStatus'],{**current['cleanMissionStatus'],'phase':'run'}]
-        async def shadow(name):return SimpleNamespace(payload={'state':{'reported':{'cleanMissionStatus':states.pop(0)}}})
+        c.save_job('same',{'verified_native_pause_origins':['robot'],'mission_id':'same','started_at':now-120,'pause_since':now-60,'pause_incident':'one',
+            'held':False,'finished':False,'automatic_resume':True,'resume_count':0,'room':'Kitchen',
+            'native_anchor':recovery_context.native_anchor(current),'recovery_map_context':geometry})
+        request=recovery_store.transaction('same',lambda job,db:(job,recovery_store.reserve(db,job,'one',now)))
+        dispatched=False
+        async def shadow(name):
+            if name=='rw-software':return SimpleNamespace(payload=software)
+            if name=='rw-constatus':return SimpleNamespace(payload=connection)
+            return SimpleNamespace(payload={'state':{'reported':{**current,'cleanMissionStatus':{**current['cleanMissionStatus'],'phase':'run' if dispatched else 'pause'}}},
+                'metadata':state_payload['metadata']})
         async def send(action):
+            nonlocal dispatched
             self.assertEqual(action,'resume')
-            await self.robot._mqtt._publish('fixture-command',json.dumps({'command':action,'initiator':'localApp','time':int(time.time())}));return True
+            await self.robot._mqtt._publish('fixture-command',json.dumps({'command':action,'initiator':'localApp','time':int(time.time())}));dispatched=True;return True
         self.robot.get_named_shadow=shadow;self.robot.send_simple_command=send
-        with patch.object(c,'read_local',return_value=snapshot),patch.object(asyncio,'sleep',AsyncMock()):
-            answer=await asyncio.to_thread(mission_monitor.recover,{'mission_id':'same','incident':'one','room':'Kitchen'})
+        with patch.object(c,'read_local',return_value=snapshot),patch.object(asyncio,'sleep',AsyncMock()),patch.object(map_recovery,'current',AsyncMock(return_value=geometry)):
+            answer=await asyncio.to_thread(mission_monitor.recover,request)
         self.assertTrue(answer['robot_action_confirmed']);self.assertTrue(answer['same_mission'])
         self.assertEqual(self.raw_publish.await_count,1)
         self.assertEqual(c.notices()['events'][-1]['kind'],'recovery_result')
+        self.assertEqual(recovery_store.get(request['attempt_id'])['status'],'complete')
 
 if __name__=='__main__':unittest.main()

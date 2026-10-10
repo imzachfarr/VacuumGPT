@@ -6,3 +6,12 @@ observer-data/
 robot.json
 activation-result.json
 *.log
+
+connection-result.json
+.native/
+output/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.write-approval*.json
+*.signed

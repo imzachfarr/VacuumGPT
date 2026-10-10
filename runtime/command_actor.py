@@ -64,6 +64,10 @@ async def start(robot,blid,raw_publish):
             if request == {'diagnostic': 'voice_read'}:
                 if active:raise c.ControlError('ObserverActorBusy')
                 task=asyncio.create_task(read_voice_diagnostics(robot))
+            elif request == {'diagnostic':'fault_read'}:
+                if active:raise c.ControlError('ObserverActorBusy')
+                from recovery_diagnostics import read
+                task=asyncio.create_task(read(robot))
             elif request == {'diagnostic':'navigation_read'}:
                 if active:raise c.ControlError('ObserverActorBusy')
                 task=asyncio.create_task(read_navigation_diagnostics(robot))

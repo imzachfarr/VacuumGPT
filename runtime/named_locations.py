@@ -13,7 +13,7 @@ def get():
     with contextlib.closing(c.database()) as db:
         db.execute('CREATE TABLE IF NOT EXISTS named_locations(kind TEXT PRIMARY KEY,data TEXT NOT NULL)')
         row=db.execute('SELECT data FROM named_locations WHERE kind=?',('garbage_can',)).fetchone()
-    return {'location':json.loads(row[0]) if row else None,'navigation_available':True,'navigation_method':'native_point_clean_then_pause','navigation_hardware_verified':False}
+    return {'location':json.loads(row[0]) if row else None,'navigation_available':True,'navigation_method':'mapped_room_approach','navigation_hardware_verified':False}
 
 
 def save(map_id,map_version,snapshot_id,point):
@@ -42,4 +42,4 @@ def save(map_id,map_version,snapshot_id,point):
         data={'kind':'garbage_can','name':'Garbage can','point':list(point),'map_id':map_id,'map_version':map_version,'snapshot_id':snapshot_id,
             'created_at':prior.get('created_at',now),'updated_at':now,'revision':prior.get('revision',0)+1,'robot_commands_sent':0}
         db.execute('INSERT INTO named_locations VALUES(?,?) ON CONFLICT(kind) DO UPDATE SET data=excluded.data',('garbage_can',json.dumps(data)))
-    return {'location':data,'navigation_available':True,'navigation_method':'native_point_clean_then_pause','navigation_hardware_verified':False}
+    return {'location':data,'navigation_available':True,'navigation_method':'mapped_room_approach','navigation_hardware_verified':False}

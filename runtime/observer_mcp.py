@@ -1,4 +1,4 @@
-"""VacuumGPT MCP: SDK stdio lifecycle, bounded reads, explicit supervised command plans."""
+"""Roomba MCP: SDK stdio lifecycle, bounded reads, explicit supervised command plans."""
 import asyncio
 import json
 import logging
@@ -16,7 +16,7 @@ from room_labels import names_by_map
 
 ROOT=Path(__file__).resolve().parent
 logging.disable(logging.CRITICAL)
-mcp=FastMCP('VacuumGPT',instructions='VacuumGPT connects to the owner-selected Prime robot. Use robot_name from status for the device; never rename it. Read roomba_status first. When control_policy.direct_chat_commands is true, fulfill explicit human commands with roomba_command or roomba_clean_room and a stable unique request_id; persistent owner approval is already complete, so do not request another Terminal approval. Room cleaning requires an explicit named room; start means whole-house. Respect active missions and never silently replace one. The prepare/request-approval/control flow is only for installations without the persistent grant. Read roomba_notifications for interruptions and recovery outcomes. Never retry an uncertain command or infer coverage from travel. Never resume a faulted robot or start a fresh mission as recovery. For an explicitly owner-confirmed cleared route, roomba_retry_dock_after_clearance allows a bounded standard dock attempt on stuck navigation error 1010 only; remote fault clearance remains unverified. No generic fault-clear tool exists.')
+mcp=FastMCP('VacuumGPT',instructions='VacuumGPT connects to the owner-selected Prime robot. Use robot_name from status for the device; never rename it. Read roomba_status first. When control_policy.direct_chat_commands is true, fulfill explicit human commands with roomba_command or roomba_clean_room and a stable unique request_id; persistent owner approval is already complete, so do not request another Terminal approval. Room cleaning requires an explicit named room; start means whole-house. Respect active missions and never silently replace one. The prepare/request-approval/control flow is only for installations without the persistent grant. Read roomba_notifications for interruptions and recovery outcomes. Never retry an uncertain command or infer coverage from travel. Automatic recovery must never resume a faulted robot or start a fresh mission. The explicitly human-confirmed inspected-brush tool permits one standard resume attempt on error2 only; it remains subject to onboard protections and does not guarantee fault clearing or saved planner continuity. For an explicitly owner-confirmed cleared route, roomba_retry_dock_after_clearance allows a bounded standard dock attempt on stuck navigation error 1010 only; remote fault clearance remains unverified. Read roomba_fault_diagnostics to distinguish fresh robot reports from cached shadow reads and inspect the device command echo. A soft reboot ends the native mission and is not an automatic recovery grant or a way to restore the onboard planner. No generic fault-clear tool exists.')
 READ=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False)
 WRITE=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True)
 LOCAL=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=False)
@@ -35,6 +35,29 @@ async def roomba_status()->dict:
     data['robot_name']=__import__('roo_config').ROBOT_NAME
     data['control_policy']={**control.policy(),'supported_actions':list(control.ACTIONS),'regional_payload_supported':True}
     return data
+
+@mcp.tool(annotations=READ)
+async def roomba_fault_diagnostics()->dict:
+    """Read fixed exact-device mission/error metadata, filtered ro-stats, sanitized lastCommand and recovery_assessment through the observer session. Reports whether an inspected normal resume is a candidate, without granting it. Ended cycles cannot be treated as retained missions. GET freshness alone does not prove a fresh robot report. Recognized native brush faults and motor current/speed are not exposed by these shadows; no override or unfinished-only fault recovery is verified. Never infer unfinished coverage from missionId."""
+    from recovery_diagnostics import read_via_actor
+    return await safe(read_via_actor)
+
+@mcp.tool(annotations=READ)
+async def roomba_recovery_status()->dict:
+    """Read native recovery eligibility, durable attempts and preserved room intent. A stopped cycle or reboot cannot restore unfinished coverage; unknown pause origin and active faults block automatic resume. Queued work survives a Mac restart; possibly dispatched work is never replayed."""
+    import mission_monitor
+    import recovery_store
+    snapshot = await safe(control.read_local, '/api/status')
+    current = snapshot.get('state', {}).get('data', {})
+    mission_id = current.get('cleanMissionStatus', {}).get('missionId')
+    job = await safe(control.job, mission_id) if mission_id else None
+    allowed, reason = await safe(mission_monitor.recovery_allowed, current, job, control.policy(), __import__('time').time())
+    attempts = await safe(recovery_store.list_attempts, 20, mission_id)
+    return {'robot_name': __import__('roo_config').ROBOT_NAME, 'mission_id': mission_id, 'eligible_now': allowed,
+            'reason': reason, 'state_stale': snapshot.get('state_stale'),
+            'job': job, 'attempts': attempts, 'native_planner_restore_supported': False,
+            'unfinished_area_reconstruction_verified': False,
+            'automatic_fault_reset_enabled': False}
 
 @mcp.tool(annotations=READ)
 def roomba_rooms()->dict:
@@ -127,6 +150,13 @@ async def roomba_retry_dock_after_clearance(request_id:str,path_clear_confirmed:
     if path_clear_confirmed is not True:return {'error_code':'ExplicitOwnerPathClearConfirmationRequired','may_have_executed':False}
     from direct_control import run
     return await safe(run,'dock',request_id,owner_navigation_retry=True)
+
+@mcp.tool(annotations=WRITE)
+async def roomba_retry_resume_after_brush_inspection(request_id:str,brush_checked_free:bool=False)->dict:
+    """One standard resume attempt only after the human confirms main brush inspection finds no obstruction. Exact fresh stuck error2 with a complete retained clean-cycle anchor, zero readiness blockers, battery>=25, one claim per mission and at most one in six hours. Ended/none cycles are refused before publish to prevent a new whole-house clean. It does not reset/clear errors or bypass onboard protection. Acceptance and saved planner continuity are unverified until same mission runs fault-free. Never fallback to start; unknown delivery is never retried."""
+    if brush_checked_free is not True:return {'error_code':'ExplicitPhysicalBrushInspectionRequired','may_have_executed':False}
+    from direct_control import run
+    return await safe(run,'resume',request_id,owner_brush_retry=True)
 
 @mcp.tool(annotations=READ)
 async def roomba_notifications(after:Annotated[int,Field(ge=0)]=0,limit:Annotated[int,Field(ge=1,le=100)]=50)->dict:

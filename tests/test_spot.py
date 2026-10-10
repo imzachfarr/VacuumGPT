@@ -21,9 +21,12 @@ def box(x=0,y=0,w=10):return {'type':'Polygon','coordinates':[[[x,y],[x+w,y],[x+
 
 class SpotTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.stack=contextlib.ExitStack();self.root=Path(self.temp.name)
+        self.temp=tempfile.TemporaryDirectory(prefix='vacuumgpt-spot-',dir='/tmp');self.stack=contextlib.ExitStack();self.root=Path(self.temp.name)
         self.stack.enter_context(patch.object(c,'ROOT',self.root));self.stack.enter_context(patch.object(approval,'ROOT',self.root))
-        self.stack.enter_context(patch.object(c,'policy',return_value={'experimental_geometry_commands':True,'direct_chat_commands':True,'automatic_resume':False}))
+        self.stack.enter_context(patch.object(approval,'PENDING',self.root/'.write-approval.json'))
+        for module in (c,approval,w):self.stack.enter_context(patch.object(module,'TARGET','fixture-sku'))
+        for module in (c,w):self.stack.enter_context(patch.object(module,'FINGERPRINT','fixture-fingerprint'))
+        self.stack.enter_context(patch.object(c,'policy',return_value={'direct_chat_commands':True,'automatic_resume':False,'experimental_geometry_commands':True}))
         c.database().close();(self.root/'activation-result.json').write_text(json.dumps({'writes_enabled':True,'write_actions':['start']}))
         self.snapshot={'target_sku':c.TARGET,'state_stale':False,'connection':{'data':{'status':'connected'}},'maps':[{'id':1}],
             'state':{'data':{'cleanMissionStatus':{'phase':'charge','error':0,'missionId':'before'},'p2maps':[{'p2map_id':'map','p2mapv_id':'v1'}]}}}
@@ -32,6 +35,11 @@ class SpotTests(unittest.TestCase):
         self.stack.enter_context(patch.object(c,'read_local',side_effect=lambda path:self.snapshot if path=='/api/status' else self.doc))
     def tearDown(self):self.stack.close();self.temp.cleanup()
     def prepare(self):return c.prepare('clean_area',self.snapshot,map_id='map',map_version='v1',snapshot_id=1,area_points=self.points)
+    def test_failed_targeting_blocks_new_and_preexisting_plans(self):
+        plan=self.prepare()
+        with patch.object(c,'policy',return_value={'direct_chat_commands':True,'experimental_geometry_commands':True,'spot_cleaning_blocked':True}):
+            with self.assertRaisesRegex(c.ControlError,'SpotTargetingFailedRequiresCommandFix'):self.prepare()
+            with self.assertRaisesRegex(c.ControlError,'SpotTargetingFailedRequiresCommandFix'):w.load_approved(plan['plan_id'])
     def test_exact_polygon_wire_and_no_global_or_room_fallback(self):
         p=self.prepare();body=c.region_command(p,'fixture').to_json()
         self.assertEqual(body['regions'][0]['type'],'tid');self.assertEqual(body['regions'][0]['region_id'],'161')

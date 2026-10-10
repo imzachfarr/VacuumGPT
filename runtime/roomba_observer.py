@@ -20,6 +20,9 @@ from observer_store import Store, sanitize
 from room_labels import names_by_map
 import control_layer
 import mission_monitor
+import recovery_store
+import recovery_context
+import map_recovery
 import stationary_review
 import command_actor
 import local_schedules
@@ -28,9 +31,7 @@ import dashboard_commands
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "source-review/prime"))
 DATA = ROOT / "observer-data"
-from roo_config import PORT
-from roo_config import TARGET
-from roo_config import FINGERPRINT
+from roo_config import PORT, TARGET, FINGERPRINT
 logging.disable(logging.CRITICAL)
 os.umask(0o077)
 
@@ -63,7 +64,7 @@ def status():
                 "robot_name": __import__("roo_config").ROBOT_NAME, "control_policy":control_layer.policy(),
                 "target_sku": TARGET, "connection": latest("connection"),
                 "identity":latest('identity'),
-                "state": state, "pose": live, "pose_stale": not live or live["age_seconds"] > 15,
+                "state": state, "pose": live, "pose_stale": not live or live["age_seconds"] > 15 or not state or live["mission"] != state["mission"],
                 "mission_history": latest('mission_history'), "map_error": latest('map_error'),
                 "map_retention_gap":latest('map_retention_gap'),
                 "state_stale": not state or state["age_seconds"] > 90,
@@ -74,7 +75,7 @@ def status():
                 "missions": [{"mission": r[0], "segments": r[1], "first_seen": r[2], "last_seen": r[3]}
                     for r in db.execute("SELECT mission,COUNT(DISTINCT segment),MIN(at),MAX(at) FROM events WHERE mission IS NOT NULL GROUP BY mission ORDER BY MAX(at) DESC LIMIT 50")],
                 "maps": [{"id": r[0], "at": r[1], "mission": r[2], "source": r[3], "layers": json.loads(r[4])}
-                         for r in db.execute("SELECT id,at,mission,source,layers FROM maps ORDER BY id DESC LIMIT 30")],
+                         for r in db.execute("SELECT id,at,mission,source,layers FROM maps WHERE source='saved_map' OR id IN (SELECT id FROM maps ORDER BY id DESC LIMIT 30) ORDER BY id DESC")],
                 "capabilities": {"observe_state": True, "observe_pose": True, "retain_maps": True,
                     "pause_resume": "owner-granted chat controls; bounded same-mission recovery",
                     "coverage": "Only vendor layers count as coverage; trajectory is never treated as cleaned coverage",
@@ -102,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
                 data=(ROOT/'frontend'/self.path.rsplit('/',1)[-1]).read_bytes()
                 content_type='text/css; charset=utf-8' if self.path.endswith('.css') else 'text/javascript; charset=utf-8'
             elif self.path in ('/favicon.svg','/favicon.ico'):
-                data=b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#202327"/><text x="32" y="45" text-anchor="middle" font-family="Arial,sans-serif" font-size="44" font-weight="700" fill="#eef1f5">V</text></svg>'
+                data=b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#202327"/><text x="32" y="45" text-anchor="middle" font-family="Arial,sans-serif" font-size="44" font-weight="700" fill="#eef1f5">R</text></svg>'
                 content_type='image/svg+xml'
             elif self.path == "/api/status":
                 data = json.dumps(status()).encode()
@@ -236,7 +237,7 @@ async def connected_session(store, stop):
         robot = await PrimeFactory.create_prime_robot(session, email, password, country,
                             blid=blid, login_result=auth, auto_refresh=True)
         mqtt_publish = robot._mqtt._publish
-        allowed = {_shadow_base(blid, name)+"/get" for name in (None, "ro-currentstate", *command_actor.VOICE_SHADOW_FIELDS)}
+        allowed = {_shadow_base(blid, name)+"/get" for name in (None, "ro-currentstate", *command_actor.VOICE_SHADOW_FIELDS, "rw-software", "rw-constatus", "ro-stats")}
         async def read_publish(topic, payload, timeout=5.0):
             if topic not in allowed or payload not in (b"", ""):
                 raise RuntimeError("WriteBlocked")
@@ -261,7 +262,7 @@ async def connected_session(store, stop):
             actor=await command_actor.start(robot,blid,mqtt_publish)
             store.event('command_transport',{'owner':'observer_mqtt_session','private_unix_socket':True,'second_mqtt_session':False})
             pending_maps = asyncio.Queue(maxsize=32)
-            recoveries=asyncio.Queue(maxsize=1)
+            recovery_wakeup=asyncio.Event()
             async def states():
                 failures = 0
                 last_history_mission=None
@@ -270,6 +271,16 @@ async def connected_session(store, stop):
                     try:
                         payload = (await robot.get_named_shadow("ro-currentstate")).payload
                         current = payload.get("state", {}).get("reported", {})
+                        software_payload = {}; connection_payload = {}; geometry = None
+                        if recovery_context.needs_pause_evidence(current.get('cleanMissionStatus', {})):
+                            software_payload = (await robot.get_named_shadow('rw-software')).payload
+                            connection_payload = (await robot.get_named_shadow('rw-constatus')).payload
+                            saved_job = control_layer.job(current.get('cleanMissionStatus', {}).get('missionId'))
+                            target_ids = (saved_job or {}).get('recovery_map_context', {}).get('region_ids') if (saved_job or {}).get('recovery_map_context') else None
+                            if saved_job and saved_job.get('recovery_map_context'):
+                                try: geometry = await map_recovery.current(robot, current, target_ids)
+                                except Exception as exc: store.event('recovery_map_error', {'type': type(exc).__name__})
+                        current = recovery_context.enrich(current, payload, software_payload, connection_payload, geometry)
                         p2maps = current.get('p2maps') or []
                         store.map_id = p2maps[0].get('p2map_id') if p2maps else None
                         store.map_version = p2maps[0].get('p2mapv_id') if p2maps else None
@@ -277,7 +288,7 @@ async def connected_session(store, stop):
                         store.set_mission(mission)
                         store.event("state", current)
                         recovery=await asyncio.to_thread(mission_monitor.evaluate,current)
-                        if recovery and not recoveries.full():recoveries.put_nowait(recovery)
+                        if recovery: recovery_wakeup.set()
                         if current.get('cleanMissionStatus',{}).get('phase')=='run' and store.last and time.time()-store.last[1]>120:
                             control_layer.notify('trajectory-stale:'+str(mission),{'kind':'trajectory_stale','mission_id':mission,
                                 'message':'State says running but live trajectory is stale; inspect Roomba. No automatic restart.'})
@@ -294,15 +305,28 @@ async def connected_session(store, stop):
                             raise RuntimeError("RepeatedStateFailure")
                     await asyncio.sleep(10)
             async def recovery_worker():
+                # SQLite owns queued work. The event only reduces latency; losing it
+                # or restarting this Mac cannot erase a reserved recovery.
                 while not stop.is_set():
-                    request=await recoveries.get()
+                    pending = await asyncio.to_thread(recovery_store.pending, 1)
+                    if not pending:
+                        recovery_wakeup.clear()
+                        try: await asyncio.wait_for(recovery_wakeup.wait(), 2)
+                        except asyncio.TimeoutError: pass
+                        continue
+                    row = pending[0]
+                    request = {k: row[k] for k in ('attempt_id', 'mission_id', 'incident', 'generation')}
                     try:
-                        result=await asyncio.to_thread(mission_monitor.recover,request)
-                        store.event('recovery_result',result)
+                        result = await asyncio.to_thread(mission_monitor.recover, request)
+                        store.event('recovery_result', result)
                     except Exception as exc:
-                        store.event('recovery_refused',{'type':type(exc).__name__,'mission':request['mission_id']})
-                        control_layer.notify('recovery-refused:'+request['mission_id']+':'+request['incident'],
-                            {'kind':'recovery_refused','mission_id':request['mission_id'],'message':'Automatic resume refused; no retry. Inspect Roomba status.'})
+                        store.event('recovery_refused', {'type': type(exc).__name__, 'mission': request['mission_id']})
+                        saved = recovery_store.get(request['attempt_id'])
+                        if saved and saved['status'] not in recovery_store.TERMINAL:
+                            recovery_store.finish(request['attempt_id'], 'needs_attention', {'error_code': str(exc) if isinstance(exc, control_layer.ControlError) else type(exc).__name__})
+                        control_layer.notify('recovery-refused:' + request['attempt_id'],
+                            {'kind': 'recovery_refused', 'mission_id': request['mission_id'],
+                             'attempt_id': request['attempt_id'], 'message': 'Automatic resume refused; inspect Roomba status. No command replay.'})
             async def stationary_worker():
                 while not stop.is_set():
                     try:await asyncio.to_thread(stationary_review.observe,status())
@@ -385,6 +409,7 @@ async def connected_session(store, stop):
             await robot.disconnect()
 
 async def run():
+    recovery_store.reconcile()
     store = Store(DATA)
     # Preserve the successful temporary session as an older, separate segment.
     if not store.db.execute("SELECT 1 FROM events WHERE kind='temporary_session_import' LIMIT 1").fetchone():

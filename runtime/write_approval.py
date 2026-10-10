@@ -35,7 +35,9 @@ def consume(action, plan=None):
     finally:
         claimed.unlink(missing_ok=True)
     now=time.time()
-    if action not in setup.get('write_actions',[]) and not (action in ('clean_room','clean_area','drive_garbage') and item.get('explicit_owner_request')):
+    one_reboot = (action=='soft_reboot' and plan and plan.get('one_use_soft_reboot') is True and
+        str(item.get('explicit_owner_request','')).startswith('owner-requested one-use soft reboot:'))
+    if action not in setup.get('write_actions',[]) and not one_reboot and not (action in ('clean_room','clean_area','drive_garbage') and item.get('explicit_owner_request')):
         raise PermissionError('RegionalScopeApprovalRequired')
     if item.get("action")!=action or item.get("target_sku")!=TARGET or item.get("expires_at",0)<now or not 0<=now-item.get('approved_at',0)<=120:
         raise PermissionError("ApprovalMismatchOrExpired")

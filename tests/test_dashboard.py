@@ -1,4 +1,4 @@
-"""Offline HTTP boundary and durable dispatch tests; never moves VacuumGPT."""
+"""Offline HTTP boundary and durable dispatch tests; never moves Roomba."""
 import contextlib
 import json
 from pathlib import Path
@@ -15,8 +15,11 @@ import roomba_observer as o
 
 class DashboardTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.stack=contextlib.ExitStack()
+        self.temp=tempfile.TemporaryDirectory(prefix='vacuumgpt-dashboard-',dir='/tmp');self.stack=contextlib.ExitStack()
         self.stack.enter_context(patch.object(c,'ROOT',Path(self.temp.name)))
+        for module in (c,o):
+            self.stack.enter_context(patch.object(module,'TARGET','fixture-sku'))
+            self.stack.enter_context(patch.object(module,'FINGERPRINT','fixture-fingerprint'))
         self.stack.enter_context(patch.object(c,'policy',return_value={'direct_chat_commands':True}))
         c.database().close()
     def tearDown(self):

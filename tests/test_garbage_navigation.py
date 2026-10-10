@@ -1,6 +1,9 @@
 import asyncio
+import contextlib
 import copy
 import json
+from pathlib import Path
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -8,6 +11,24 @@ import garbage_navigation as g
 import control_layer as c
 
 class NavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='vacuumgpt-navigation-',dir='/tmp')
+        self.stack=contextlib.ExitStack()
+        self.stack.enter_context(patch.object(c,'ROOT',Path(self.temp.name)))
+        self.stack.enter_context(patch.object(c,'TARGET','fixture-sku'))
+        self.stack.enter_context(patch.object(c,'FINGERPRINT','fixture-fingerprint'))
+        self.stack.enter_context(patch.object(c,'policy',return_value={'experimental_geometry_commands':True}))
+    def tearDown(self):self.stack.close();self.temp.cleanup()
+    def test_room_approach_exact_scope_and_unverified_frame(self):
+        plan={'action':'drive_garbage','destination':[3.,-2.],'map_id':'house','map_version':'v1','navigation_method':'mapped_room_approach','region_id':'13'}
+        body=c.region_command(plan,'robot').to_json();body.update(initiator='localApp',time=int(time.time()))
+        self.assertTrue(c.payload_matches(plan,body,'robot'))
+        self.assertEqual(body['regions'][0]['region_id'],'13')
+        for change in ({'regions':[]},{'select_all':True},{'p2map_id':'other'},{'command':'point_clean'}):
+            self.assertFalse(c.payload_matches(plan,{**body,**change},'robot'))
+        status={'pose_stale':False,'pose':{'at':time.time()+1,'age_seconds':0,'mission':'trip','data':{'map_id':'house','points':[{'x':3.,'y':-2.}]}}}
+        self.assertIsNone(g.distance(status,plan,'trip',time.time()))
+
     def test_arrival_requires_fresh_same_mission_and_map(self):
         plan={'map_id':'house','destination':[3.,-2.]};s={'pose_stale':False,'pose':{'at':101,'age_seconds':1,'mission':'trip','data':{'map_id':'house','points':[{'x':3.1,'y':-2.}]}}}
         self.assertAlmostEqual(g.distance(s,plan,'trip',100),.1)
